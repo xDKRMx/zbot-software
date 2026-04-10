@@ -1,0 +1,25 @@
+digraph pipeline_segmentation {
+  rankdir=LR;
+  fontsize=16;
+  labelloc="t";
+  label="Segmentation Pipeline";
+  fontname="Helvetica";
+  bgcolor="transparent";
+  pad="0.2";
+  nodesep="0.4";
+  ranksep="0.5";
+
+  node [shape=box, style="rounded,filled", fontsize=11, fontname="Helvetica", color="#37474F"];
+  edge [color="#546E7A", penwidth=1.4, arrowsize=0.8];
+
+  Input [label="Image / Camera Frame", fillcolor="#E3F2FD"];
+  Pre [label="Preprocess\n(resize + normalize)", fillcolor="#E8F5E9"];
+  Model [label="DeepLabV3\n(PyTorch)", fillcolor="#C8E6C9"];
+  Mask [label="Class Mask", fillcolor="#FFF3E0"];
+  Net [label="Net Mask\n(HSV green)", fillcolor="#FFE0B2"];
+  Overlays [label="Overlay\n(seg + net + debris + fire)", fillcolor="#F3E5F5"];
+  Output [label="Display + Save", fillcolor="#F3E5F5"];
+
+  Input -> Pre -> Model -> Mask -> Overlays -> Output;
+  Input -> Net -> Overlays;
+}

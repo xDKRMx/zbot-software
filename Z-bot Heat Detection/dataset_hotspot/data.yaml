@@ -1,0 +1,5 @@
+path: C:\Z-bot Heat Detection\dataset_hotspot
+train: images/train
+val: images/val
+names:
+  0: hotspot

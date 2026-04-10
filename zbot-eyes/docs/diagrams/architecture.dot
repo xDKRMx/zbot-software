@@ -1,0 +1,62 @@
+digraph architecture {
+  rankdir=LR;
+  fontsize=16;
+  labelloc="t";
+  label="Net Inspector - Segmentation GUI Architecture";
+  fontname="Helvetica";
+  bgcolor="transparent";
+  pad="0.2";
+  nodesep="0.4";
+  ranksep="0.5";
+
+  node [shape=box, style="rounded,filled", fontsize=11, fontname="Helvetica", color="#37474F", fillcolor="#ECEFF1"];
+  edge [color="#546E7A", penwidth=1.4, arrowsize=0.8];
+
+  subgraph cluster_ui {
+    label="GUI";
+    style="rounded,filled";
+    color="#1E88E5";
+    fontcolor="#0D47A1";
+    fillcolor="#E3F2FD";
+    node [fillcolor="#BBDEFB"];
+    Controls [label="Controls\n(sliders, toggles)"];
+    Panels [label="Panels\n(input / output)"];
+    Status [label="Status\n(seg FPS, debris)"];
+  }
+
+  subgraph cluster_core {
+    label="Core";
+    style="rounded,filled";
+    color="#43A047";
+    fontcolor="#1B5E20";
+    fillcolor="#E8F5E9";
+    node [fillcolor="#C8E6C9"];
+    Segmenter [label="PyTorch Segmenter\n(DeepLabV3)"];
+    NetMask [label="Net Mask\n(HSV green)" ];
+    Overlays [label="Overlays\n(seg + net + debris + fire)"];
+  }
+
+  subgraph cluster_io {
+    label="I/O";
+    style="rounded,filled";
+    color="#FB8C00";
+    fontcolor="#E65100";
+    fillcolor="#FFF3E0";
+    node [fillcolor="#FFE0B2"];
+    Camera [label="Camera Frames"];
+    Images [label="Loaded / Demo Images"];
+    Outputs [label="outputs/annotated"];
+    Models [label="models/deeplabv3_resnet50.pth"];
+  }
+
+  Controls -> NetMask;
+  Controls -> Segmenter;
+  Camera -> Segmenter;
+  Images -> Segmenter;
+  Segmenter -> Overlays;
+  NetMask -> Overlays;
+  Overlays -> Panels;
+  Overlays -> Outputs;
+  Segmenter -> Models [style=dashed, label="weights"];
+  Panels -> Status;
+}

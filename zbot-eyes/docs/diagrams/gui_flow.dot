@@ -1,0 +1,32 @@
+digraph gui_flow {
+  rankdir=LR;
+  fontsize=16;
+  labelloc="t";
+  label="GUI Flow";
+  fontname="Helvetica";
+  bgcolor="transparent";
+  pad="0.2";
+  nodesep="0.4";
+  ranksep="0.5";
+
+  node [shape=box, style="rounded,filled", fontsize=11, fontname="Helvetica", color="#37474F"];
+  edge [color="#546E7A", penwidth=1.4, arrowsize=0.8];
+
+  Generate [label="Generate demo image", fillcolor="#E3F2FD"];
+  Load [label="Load image", fillcolor="#E3F2FD"];
+  Segment [label="Run Segmentation", fillcolor="#C8E6C9"];
+  LiveOn [label="Live Camera ON", fillcolor="#FFE0B2"];
+  LiveOff [label="Stop Camera", fillcolor="#FFE0B2"];
+  Input [label="Input panel", fillcolor="#FFF3E0"];
+  Output [label="Segmentation output", fillcolor="#FFF3E0"];
+  Report [label="Debris report + FPS", fillcolor="#F3E5F5"];
+
+  Generate -> Input;
+  Load -> Input;
+  Input -> Segment;
+  Segment -> Output;
+  LiveOn -> Input;
+  LiveOn -> Output;
+  LiveOff -> Input;
+  Output -> Report;
+}

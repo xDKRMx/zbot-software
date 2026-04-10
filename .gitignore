@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# Virtual envs (nested)
+Z-bot Heat Detection/.venv/
+zbot-eyes/.venv/
+panoramic_heat_extraction/.venv/
+
+# Model weights (large files)
+*.pt
+*.pth
+*.onnx
+
+# Dataset images (too large for git)
+Z-bot Heat Detection/dataset_hotspot/images/
+Z-bot Heat Detection/dataset_hotspot/labels/
+Z-bot Heat Detection/tbbr_sample/
+Z-bot Heat Detection/runs/
+Z-bot Heat Detection/Detections/
+
+# Outputs / logs
+outputs/
+logs/
+*.log
+GLMCurrentResponse.txt
+zbot-eyes/GLMCurrentResponse.txt
+zbot-eyes/outputs/
+
+# Secrets
+secrets/
+*.key
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# MCP — exclude entirely (too large, has its own repo)
+.mcp/
+
+# Audit data
+.audit-data/
+${workspaceFolder}/

@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+
+# Virtual environments / env files
+.venv/
+venv/
+ENV/
+.python-version
+
+# Environment variable files (do not commit secrets)
+# Note: .env is tracked with placeholder, actual keys go in secrets/
+.env.*
+*.env
+!.env
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Outputs and logs
+outputs/*
+!outputs/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# Runtime response file for Raspberry Pi sensor
+GLMCurrentResponse.txt
+data/demo/*
+!data/demo/.gitkeep
+data/pictures/*
+!data/pictures/.gitkeep
+data/**/results/*
+data/**/tmp/*
+
+# Model weights
+models/*.pth
+models/*.pt
+models/*.onnx
+models/*.tflite
+models/*.bin
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log
+
+# Secrets
+secrets/*
+!secrets/.gitkeep
+!secrets/README.md

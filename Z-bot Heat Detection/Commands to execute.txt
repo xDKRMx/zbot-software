@@ -1,0 +1,8 @@
+MAIN COMMAND (with preview, auto-saves to detections/ folder on ALARM):
+python src/infer_rpi.py --mode yolo --weights runs/detect/hotspot_yolov8n/weights/best.pt --show --conf 0.25 --alarm-conf 0.5
+
+RASPBERRY PI COMMAND (headless, auto-saves to detections/ folder):
+python src/infer_rpi.py --mode yolo --weights runs/detect/hotspot_yolov8n/weights/best.pt --conf 0.25 --alarm-conf 0.5
+
+DEBUG MODE (show all classes, low confidence):
+python src/infer_rpi.py --mode yolo --weights runs/detect/hotspot_yolov8n/weights/best.pt --show --all-classes --conf 0.10

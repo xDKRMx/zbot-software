@@ -1,0 +1,57 @@
+{
+  "mcpServers": {
+    "muctehid": {
+      "command": "node",
+      "args": [".mcp/muctehid/dist/index.js"],
+      "env": {
+        "REPO_ROOT": "${workspaceFolder}",
+        "AUDIT_DATA_DIR": "${workspaceFolder}/.audit-data"
+      },
+      "disabled": false,
+      "autoApprove": [
+        "index_codebase",
+        "search_code",
+        "add_memory",
+        "get_context",
+        "memory_stats",
+        "clear_memory",
+        "audit_file",
+        "audit_diff",
+        "security_scan",
+        "find_secrets",
+        "find_todos",
+        "complexity_score",
+        "dependency_audit",
+        "health_score",
+        "list_skills",
+        "run_skill",
+        "install_skill",
+        "remove_skill",
+        "skill_info",
+        "create_skill",
+        "git_diff_audit",
+        "git_blame_context",
+        "pre_commit_check",
+        "commit_history_search",
+        "install_hooks",
+        "generate_report",
+        "export_report",
+        "compare_reports",
+        "find_references",
+        "get_dependencies",
+        "analyze_complexity",
+        "route_task",
+        "suggest_skill",
+        "spec_init",
+        "spec_list",
+        "spec_get",
+        "spec_update_status",
+        "spec_generate",
+        "task_create",
+        "task_list",
+        "task_get",
+        "task_update"
+      ]
+    }
+  }
+}
