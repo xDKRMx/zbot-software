@@ -107,18 +107,25 @@ class FeatureAligner:
 # ---------------------------------------------------------------------------
 
 class CanvasManager:
-    """Manages a growing float32 thermal canvas with distance-weighted blending."""
+    """Growing float32 thermal canvas — hybrid override + edge-catching.
+
+    Override semantics: last write wins per pixel (no blending accumulation).
+    Edge-catching mask: only write pixels from the newly-revealed region
+    based on translation vector (tx, ty) from AKAZE.
+    """
 
     def __init__(
         self,
         frame_h: int,
         frame_w: int,
         padding_factor: int = 3,
+        overlap_margin_px: int = 20,
+        rotation_threshold_deg: float = 5.0,
     ) -> None:
         ch = frame_h * padding_factor
         cw = frame_w * padding_factor
         self._canvas = np.zeros((ch, cw), dtype=np.float32)
-        self._weight = np.zeros((ch, cw), dtype=np.float32)
+        self._visited = np.zeros((ch, cw), dtype=bool)
         self._offset_x = frame_w * (padding_factor // 2)
         self._offset_y = frame_h * (padding_factor // 2)
         self._H_offset = np.array(
@@ -126,6 +133,10 @@ class CanvasManager:
              [0, 1, self._offset_y],
              [0, 0, 1]], dtype=np.float64,
         )
+        self._margin = overlap_margin_px
+        self._rot_threshold = rotation_threshold_deg
+        self._frame_h = frame_h
+        self._frame_w = frame_w
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -141,13 +152,32 @@ class CanvasManager:
         y0 = self._offset_y
         x0 = self._offset_x
         self._canvas[y0:y0 + h, x0:x0 + w] = thermal_gray.astype(np.float32)
-        self._weight[y0:y0 + h, x0:x0 + w] = 1.0
+        self._visited[y0:y0 + h, x0:x0 + w] = True
 
-    def warp_and_blend(self, thermal_gray: np.ndarray, H_accumulated: np.ndarray) -> bool:
-        """Warp *thermal_gray* onto the canvas using accumulated homography.
+    def _compute_edge_mask(self, tx: float, ty: float) -> np.ndarray:
+        """Build frame-space bool mask of newly revealed pixels."""
+        h, w = self._frame_h, self._frame_w
+        m = self._margin
+        mask = np.zeros((h, w), dtype=bool)
 
-        Returns True if the frame contributed non-zero pixels.
-        """
+        if tx > 0:
+            mask[:, :min(int(abs(tx)) + m, w)] = True
+        elif tx < 0:
+            mask[:, max(0, w - int(abs(tx)) - m):] = True
+
+        if ty > 0:
+            mask[:min(int(abs(ty)) + m, h), :] = True
+        elif ty < 0:
+            mask[max(0, h - int(abs(ty)) - m):, :] = True
+
+        if mask.sum() < (h * w * 0.01):
+            mask[:] = True
+        return mask
+
+    def warp_and_blend(self, thermal_gray: np.ndarray, H_accumulated: np.ndarray,
+                       tx: float = 0.0, ty: float = 0.0,
+                       angle_deg: float = 0.0) -> bool:
+        """Warp thermal frame onto canvas using override + edge-catching."""
         ch, cw = self._canvas.shape
         H_canvas = self._H_offset @ H_accumulated
 
@@ -155,33 +185,36 @@ class CanvasManager:
             thermal_gray.astype(np.float32), H_canvas, (cw, ch),
             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
         )
+        warped_has_data = warped > 0
 
-        warped_mask = (warped > 0).astype(np.uint8) * 255
-        if cv2.countNonZero(warped_mask) == 0:
+        if not warped_has_data.any():
             return False
 
-        # Distance-from-edge weights for smooth blending
-        dist = cv2.distanceTransform(warped_mask, cv2.DIST_L2, 5)
-        max_dist = dist.max()
-        if max_dist > 0:
-            blend_w = (dist / max_dist).astype(np.float32)
+        if abs(angle_deg) < self._rot_threshold:
+            frame_edge_mask = self._compute_edge_mask(tx, ty)
+            edge_canvas = cv2.warpPerspective(
+                frame_edge_mask.astype(np.uint8), H_canvas, (cw, ch),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+            ).astype(bool)
+            edge_write = edge_canvas & warped_has_data
         else:
-            blend_w = (warped_mask / 255.0).astype(np.float32)
+            edge_write = np.zeros((ch, cw), dtype=bool)
 
-        # Weighted accumulation
-        total_w = self._weight + blend_w + 1e-8
-        self._canvas = (self._canvas * self._weight + warped * blend_w) / total_w
-        self._weight = np.minimum(self._weight + blend_w, 10.0)  # cap to avoid float overflow
+        unvisited_write = ~self._visited & warped_has_data
+        write_mask = edge_write | unvisited_write
 
+        if not write_mask.any():
+            return False
+
+        self._canvas[write_mask] = warped[write_mask]
+        self._visited[write_mask] = True
         return True
 
     def expand_if_needed(self, margin: int = 50) -> bool:
-        """Expand canvas if content is within *margin* pixels of any edge.
-
-        Returns True if expansion occurred.
-        """
-        rows = np.any(self._weight > 0, axis=1)
-        cols = np.any(self._weight > 0, axis=0)
+        """Expand canvas if content is within *margin* pixels of any edge."""
+        rows = np.any(self._visited, axis=1)
+        cols = np.any(self._visited, axis=0)
         if not rows.any():
             return False
 
@@ -199,8 +232,8 @@ class CanvasManager:
 
         self._canvas = np.pad(self._canvas, ((pad_y, pad_y), (pad_x, pad_x)),
                               mode='constant', constant_values=0)
-        self._weight = np.pad(self._weight, ((pad_y, pad_y), (pad_x, pad_x)),
-                              mode='constant', constant_values=0)
+        self._visited = np.pad(self._visited, ((pad_y, pad_y), (pad_x, pad_x)),
+                               mode='constant', constant_values=False)
 
         self._offset_x += pad_x
         self._offset_y += pad_y
@@ -209,13 +242,12 @@ class CanvasManager:
         return True
 
     def get_cropped(self) -> np.ndarray:
-        """Return the canvas cropped to the non-zero bounding box."""
-        mask = self._weight > 0
-        if not mask.any():
+        """Return the canvas cropped to the visited bounding box."""
+        if not self._visited.any():
             return self._canvas.copy()
 
-        rows = np.any(mask, axis=1)
-        cols = np.any(mask, axis=0)
+        rows = np.any(self._visited, axis=1)
+        cols = np.any(self._visited, axis=0)
         rmin, rmax = np.where(rows)[0][[0, -1]]
         cmin, cmax = np.where(cols)[0][[0, -1]]
         return self._canvas[rmin:rmax + 1, cmin:cmax + 1].copy()
@@ -427,7 +459,7 @@ class PanoramaStitcher:
 
     def _process_frame(self, fp: FramePair) -> None:
         """Process a single frame pair (called under lock)."""
-        # Apply RGB-thermal pixel offset if configured
+        import math
         thermal = fp.thermal_gray
         dx, dy = self._cfg.rgb_thermal_dx, self._cfg.rgb_thermal_dy
         if dx != 0 or dy != 0:
@@ -438,7 +470,10 @@ class PanoramaStitcher:
         if self._canvas_mgr is None:
             h, w = thermal.shape[:2]
             self._canvas_mgr = CanvasManager(
-                h, w, padding_factor=self._cfg.canvas_padding_factor,
+                h, w,
+                padding_factor=self._cfg.canvas_padding_factor,
+                overlap_margin_px=self._cfg.overlap_margin_px,
+                rotation_threshold_deg=self._cfg.rotation_threshold_deg,
             )
             self._canvas_mgr.place_first(thermal)
             self._prev = fp
@@ -449,59 +484,56 @@ class PanoramaStitcher:
             print("[PANORAMA] First frame placed on canvas.")
             return
 
-        # Compute homography current → previous
         H, inliers = self._aligner.compute_homography(self._prev.rgb, fp.rgb)
 
-        # Fallback: try matching with frame N-2
         if H is None and len(self._stitched) >= 2:
             alt_prev = self._stitched[-2]
             H, inliers = self._aligner.compute_homography(alt_prev.rgb, fp.rgb)
-            if H is not None:
-                # Chain through the alt frame's accumulated H
-                self._H_acc = alt_prev.H_to_canvas @ np.linalg.inv(H) if alt_prev.H_to_canvas is not None else self._H_acc
+            if H is not None and alt_prev.H_to_canvas is not None:
+                self._H_acc = alt_prev.H_to_canvas @ H
                 fp.low_confidence = True
                 self._low_conf_count += 1
 
         if H is None:
             self._frames_skipped += 1
-            fp.low_confidence = True
-            self._low_conf_count += 1
             print(f"[PANORAMA] Frame {fp.seq_id} skipped (inliers={inliers}).")
             return
 
+        # Extract movement info from H (frame-space)
+        tx = float(H[0, 2])
+        ty = float(H[1, 2])
+        angle_deg = math.degrees(math.atan2(float(H[1, 0]), float(H[0, 0])))
+        move = math.sqrt(tx**2 + ty**2)
+
+        # Reject bad matches
+        if move > self._cfg.max_move_px:
+            self._frames_skipped += 1
+            print(f"[PANORAMA] Frame {fp.seq_id} rejected: move={move:.1f}px > max={self._cfg.max_move_px}")
+            return
+
+        # Silent skip if robot hasn't moved
+        if move < self._cfg.min_move_px:
+            return
+
         if not fp.low_confidence:
-            # Normal chain: accumulate homography
-            # H maps prev→curr, we need curr→canvas, so invert
-            self._H_acc = self._H_acc @ np.linalg.inv(H)
+            self._H_acc = self._H_acc @ H
 
         fp.H_to_canvas = self._H_acc.copy()
         fp.inlier_count = inliers
         self._total_inliers += inliers
 
-        if inliers < self._cfg.min_inliers * 2:
-            fp.low_confidence = True
-            self._low_conf_count += 1
-
-        # Expand canvas if needed
         self._canvas_mgr.expand_if_needed()
-
-        # Warp and blend
-        ok = self._canvas_mgr.warp_and_blend(thermal, self._H_acc)
+        ok = self._canvas_mgr.warp_and_blend(thermal, self._H_acc, tx, ty, angle_deg)
         if ok:
             self._frames_stitched += 1
             self._stitched.append(fp)
             self._prev = fp
-
-            # Emit update event
             self._emit_update()
-
-            # Periodic drift correction
             if (self._frames_stitched % self._cfg.bundle_adjust_interval == 0
                     and self._frames_stitched > self._cfg.bundle_adjust_interval):
                 self._drift_correct()
         else:
             self._frames_skipped += 1
-            print(f"[PANORAMA] Frame {fp.seq_id} produced empty warp, skipped.")
 
     def _drift_correct(self) -> None:
         """Simple drift correction: cross-match current frame with older frames."""

@@ -179,6 +179,11 @@ class PanoramaConfig:
     thermal_maxv: int = 160
     rgb_thermal_dx: int = 0
     rgb_thermal_dy: int = 0
+    # Hybrid stitching — override + edge-catching
+    overlap_margin_px: int = 20
+    rotation_threshold_deg: float = 5.0
+    max_move_px: float = 150.0
+    min_move_px: float = 3.0
 
 
 @dataclass(frozen=True)

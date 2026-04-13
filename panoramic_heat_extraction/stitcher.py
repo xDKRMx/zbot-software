@@ -68,6 +68,12 @@ class PanoramaConfig:
     rgb_thermal_dx: int = 0
     rgb_thermal_dy: int = 0
 
+    # Hybrid stitching — override + edge-catching
+    overlap_margin_px: int = 20        # extra pixels beyond edge mask for vibration
+    rotation_threshold_deg: float = 5.0  # above this → fallback to unvisited-only
+    max_move_px: float = 150.0         # above this → reject frame (bad match/shake)
+    min_move_px: float = 3.0           # below this → skip (robot not moving)
+
     # Output
     output_dir: Path = OUTPUT_DIR
 
@@ -152,15 +158,30 @@ class FeatureAligner:
 # ---------------------------------------------------------------------------
 
 class CanvasManager:
-    def __init__(self, frame_h: int, frame_w: int, padding_factor: int = 3) -> None:
+    """Growing float32 thermal canvas with override-based pixel memory.
+
+    Hybrid approach:
+    - Override semantics: last write wins per pixel (no blending accumulation)
+    - Edge-catching mask: only write pixels from the newly-revealed region
+      based on translation vector (tx, ty) from AKAZE
+    - Vibration robustness: overlap_margin_px + rotation fallback
+    """
+
+    def __init__(self, frame_h: int, frame_w: int, padding_factor: int = 3,
+                 overlap_margin_px: int = 20,
+                 rotation_threshold_deg: float = 5.0) -> None:
         ch, cw = frame_h * padding_factor, frame_w * padding_factor
         self._canvas = np.zeros((ch, cw), dtype=np.float32)
-        self._weight = np.zeros((ch, cw), dtype=np.float32)
+        self._visited = np.zeros((ch, cw), dtype=bool)   # True = written at least once
         self._ox = frame_w * (padding_factor // 2)
         self._oy = frame_h * (padding_factor // 2)
         self._H_offset = np.array([[1, 0, self._ox],
                                    [0, 1, self._oy],
                                    [0, 0, 1]], dtype=np.float64)
+        self._margin = overlap_margin_px
+        self._rot_threshold = rotation_threshold_deg
+        self._frame_h = frame_h
+        self._frame_w = frame_w
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -171,33 +192,102 @@ class CanvasManager:
         return self._H_offset.copy()
 
     def place_first(self, gray: np.ndarray) -> None:
+        """Place the very first frame at the canvas centre."""
         h, w = gray.shape[:2]
         self._canvas[self._oy:self._oy+h, self._ox:self._ox+w] = gray.astype(np.float32)
-        self._weight[self._oy:self._oy+h, self._ox:self._ox+w] = 1.0
+        self._visited[self._oy:self._oy+h, self._ox:self._ox+w] = True
 
-    def warp_and_blend(self, gray: np.ndarray, H_acc: np.ndarray) -> bool:
+    def _compute_edge_mask(self, tx: float, ty: float) -> np.ndarray:
+        """Build frame-space bool mask of newly revealed pixels.
+
+        Based on movement direction:
+          tx > 0 → robot moved right → left edge of frame is new
+          tx < 0 → robot moved left  → right edge of frame is new
+          ty > 0 → robot moved down  → top edge of frame is new
+          ty < 0 → robot moved up    → bottom edge of frame is new
+        """
+        h, w = self._frame_h, self._frame_w
+        m = self._margin
+        mask = np.zeros((h, w), dtype=bool)
+
+        if tx > 0:    # moved right → left strip is new
+            mask[:, :min(int(abs(tx)) + m, w)] = True
+        elif tx < 0:  # moved left → right strip is new
+            mask[:, max(0, w - int(abs(tx)) - m):] = True
+
+        if ty > 0:    # moved down → top strip is new
+            mask[:min(int(abs(ty)) + m, h), :] = True
+        elif ty < 0:  # moved up → bottom strip is new
+            mask[max(0, h - int(abs(ty)) - m):, :] = True
+
+        # Fallback: if mask covers < 1% of frame, write everything
+        # (handles diagonal or very small movements)
+        if mask.sum() < (h * w * 0.01):
+            mask[:] = True
+
+        return mask
+
+    def warp_and_blend(self, gray: np.ndarray, H_acc: np.ndarray,
+                       tx: float = 0.0, ty: float = 0.0,
+                       angle_deg: float = 0.0) -> bool:
+        """Warp thermal frame onto canvas using override + edge-catching.
+
+        Args:
+            gray: thermal grayscale frame
+            H_acc: accumulated 3×3 affine homography to canvas
+            tx, ty: translation from AKAZE (frame-space pixels)
+            angle_deg: rotation angle from AKAZE transform
+
+        Returns True if any pixels were written.
+        """
         ch, cw = self._canvas.shape
         H_c = self._H_offset @ H_acc
 
-        # Use warpPerspective with the embedded affine — still correct,
-        # but the affine model prevents perspective distortion
-        warped = cv2.warpPerspective(gray.astype(np.float32), H_c, (cw, ch),
-                                     flags=cv2.INTER_LINEAR,
-                                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        mask_u8 = (warped > 0).astype(np.uint8) * 255
-        if cv2.countNonZero(mask_u8) == 0:
+        warped = cv2.warpPerspective(
+            gray.astype(np.float32), H_c, (cw, ch),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+        warped_has_data = warped > 0
+
+        if not warped_has_data.any():
             return False
-        dist = cv2.distanceTransform(mask_u8, cv2.DIST_L2, 5)
-        md = dist.max()
-        bw = (dist / md).astype(np.float32) if md > 0 else (mask_u8 / 255.0).astype(np.float32)
-        tw = self._weight + bw + 1e-8
-        self._canvas = (self._canvas * self._weight + warped * bw) / tw
-        self._weight = np.minimum(self._weight + bw, 10.0)
+
+        # --- Build write mask ---
+        if abs(angle_deg) < self._rot_threshold:
+            # Normal case: use edge-catching mask
+            frame_edge_mask = self._compute_edge_mask(tx, ty)
+
+            # Warp the frame-space edge mask to canvas coordinates
+            edge_canvas = cv2.warpPerspective(
+                frame_edge_mask.astype(np.uint8), H_c, (cw, ch),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+            ).astype(bool)
+
+            edge_write = edge_canvas & warped_has_data
+        else:
+            # Significant rotation → only write unvisited pixels
+            edge_write = np.zeros((ch, cw), dtype=bool)
+
+        # Always write unvisited pixels (first-visit guarantee)
+        unvisited_write = ~self._visited & warped_has_data
+
+        # Combined write mask
+        write_mask = edge_write | unvisited_write
+
+        if not write_mask.any():
+            return False
+
+        # Override write — last write wins, no blending
+        self._canvas[write_mask] = warped[write_mask]
+        self._visited[write_mask] = True
         return True
 
     def expand_if_needed(self, margin: int = 50) -> None:
-        rows = np.any(self._weight > 0, axis=1)
-        cols = np.any(self._weight > 0, axis=0)
+        """Expand canvas if content is within margin pixels of any edge."""
+        rows = np.any(self._visited, axis=1)
+        cols = np.any(self._visited, axis=0)
         if not rows.any():
             return
         rmin, rmax = np.where(rows)[0][[0, -1]]
@@ -208,17 +298,17 @@ class CanvasManager:
             return
         py, px = max(ch // 2, 200), max(cw // 2, 200)
         self._canvas = np.pad(self._canvas, ((py, py), (px, px)), constant_values=0)
-        self._weight = np.pad(self._weight, ((py, py), (px, px)), constant_values=0)
+        self._visited = np.pad(self._visited, ((py, py), (px, px)), constant_values=False)
         self._ox += px
         self._oy += py
         self._H_offset[0, 2] = self._ox
         self._H_offset[1, 2] = self._oy
 
     def get_cropped(self) -> np.ndarray:
-        mask = self._weight > 0
-        if not mask.any():
+        """Return canvas cropped to the visited bounding box."""
+        if not self._visited.any():
             return self._canvas.copy()
-        rows, cols = np.any(mask, axis=1), np.any(mask, axis=0)
+        rows, cols = np.any(self._visited, axis=1), np.any(self._visited, axis=0)
         r0, r1 = np.where(rows)[0][[0, -1]]
         c0, c1 = np.where(cols)[0][[0, -1]]
         return self._canvas[r0:r1+1, c0:c1+1].copy()
@@ -367,6 +457,7 @@ class PanoramaStitcher:
             self._alive = False
 
     def _process(self, fp: FramePair) -> None:
+        import math
         thermal = fp.thermal_gray
         dx, dy = self._cfg.rgb_thermal_dx, self._cfg.rgb_thermal_dy
         if dx or dy:
@@ -375,7 +466,12 @@ class PanoramaStitcher:
 
         if self._canvas_mgr is None:
             h, w = thermal.shape[:2]
-            self._canvas_mgr = CanvasManager(h, w, self._cfg.canvas_padding_factor)
+            self._canvas_mgr = CanvasManager(
+                h, w,
+                padding_factor=self._cfg.canvas_padding_factor,
+                overlap_margin_px=self._cfg.overlap_margin_px,
+                rotation_threshold_deg=self._cfg.rotation_threshold_deg,
+            )
             self._canvas_mgr.place_first(thermal)
             fp.H_to_canvas = np.eye(3, dtype=np.float64)
             self._prev = fp
@@ -390,7 +486,6 @@ class PanoramaStitcher:
             alt = self._stitched[-2]
             H, inliers = self._aligner.compute_homography(alt.rgb, fp.rgb)
             if H is not None and alt.H_to_canvas is not None:
-                # H maps alt→curr, so curr_in_canvas = alt_H_to_canvas @ H
                 self._H_acc = alt.H_to_canvas @ H
                 fp.low_confidence = True
                 self._low_conf += 1
@@ -399,9 +494,23 @@ class PanoramaStitcher:
             self.frames_skipped += 1
             return
 
+        # Extract movement info from H (frame-space)
+        tx = float(H[0, 2])
+        ty = float(H[1, 2])
+        angle_deg = math.degrees(math.atan2(float(H[1, 0]), float(H[0, 0])))
+        move = math.sqrt(tx**2 + ty**2)
+
+        # Reject bad matches (too much movement = shake / bad feature match)
+        if move > self._cfg.max_move_px:
+            self.frames_skipped += 1
+            print(f"[PANORAMA] Frame {fp.seq_id} rejected: move={move:.1f}px > max={self._cfg.max_move_px}")
+            return
+
+        # Silent skip if robot hasn't moved enough
+        if move < self._cfg.min_move_px:
+            return
+
         if not fp.low_confidence:
-            # H maps prev→curr in camera coords.
-            # To place curr on canvas: canvas_H = prev_canvas_H @ H
             self._H_acc = self._H_acc @ H
 
         fp.H_to_canvas = self._H_acc.copy()
@@ -409,7 +518,7 @@ class PanoramaStitcher:
         self._total_inliers += inliers
 
         self._canvas_mgr.expand_if_needed()
-        ok = self._canvas_mgr.warp_and_blend(thermal, self._H_acc)
+        ok = self._canvas_mgr.warp_and_blend(thermal, self._H_acc, tx, ty, angle_deg)
         if ok:
             self.frames_stitched += 1
             self._stitched.append(fp)

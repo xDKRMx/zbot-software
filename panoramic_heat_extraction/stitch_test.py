@@ -65,7 +65,9 @@ class BatchStitcher:
         grays = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) for img in images]
 
         h, w = grays[0].shape[:2]
-        canvas_mgr = CanvasManager(h, w, padding_factor=4)
+        canvas_mgr = CanvasManager(h, w, padding_factor=4,
+                                   overlap_margin_px=20,
+                                   rotation_threshold_deg=5.0)
         canvas_mgr.place_first(grays[0])
 
         H_acc = np.eye(3, dtype=np.float64)
@@ -97,9 +99,13 @@ class BatchStitcher:
                     progress_cb(i + 1, n, f"Frame {i+1} skipped — {reason}")
                 continue
 
-            # Sanity check: translation magnitude
-            tx, ty = H[0, 2], H[1, 2]
-            move = (tx**2 + ty**2) ** 0.5
+            # Extract movement info
+            import math
+            tx = float(H[0, 2])
+            ty = float(H[1, 2])
+            angle_deg = math.degrees(math.atan2(float(H[1, 0]), float(H[0, 0])))
+            move = math.sqrt(tx**2 + ty**2)
+
             if move < self._min_move:
                 stats["skipped"] += 1
                 stats["skip_reasons"].append(
@@ -116,12 +122,11 @@ class BatchStitcher:
             if inliers < 10:
                 stats["low_confidence"] += 1
 
-            # Accumulate: H maps prev→curr, so curr_on_canvas = H_acc @ inv(H)
             H_acc = H_acc @ np.linalg.inv(H)
             H_list.append(H_acc.copy())
 
             canvas_mgr.expand_if_needed()
-            ok = canvas_mgr.warp_and_blend(grays[i], H_acc)
+            ok = canvas_mgr.warp_and_blend(grays[i], H_acc, tx, ty, angle_deg)
             if ok:
                 stats["stitched"] += 1
                 stitched.append(images[i])
