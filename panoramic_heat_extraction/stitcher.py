@@ -71,8 +71,8 @@ class PanoramaConfig:
     # Hybrid stitching — override + edge-catching
     overlap_margin_px: int = 20        # extra pixels beyond edge mask for vibration
     rotation_threshold_deg: float = 5.0  # above this → fallback to unvisited-only
-    max_move_px: float = 150.0         # above this → reject frame (bad match/shake)
-    min_move_px: float = 3.0           # below this → skip (robot not moving)
+    max_move_px: float = 80.0          # above this → reject frame (bad match/shake)
+    min_move_px: float = 8.0           # below this → skip (robot not moving enough)
 
     # Output
     output_dir: Path = OUTPUT_DIR
@@ -234,11 +234,10 @@ class CanvasManager:
     def warp_and_blend(self, gray: np.ndarray, H_acc: np.ndarray,
                        tx: float = 0.0, ty: float = 0.0,
                        angle_deg: float = 0.0) -> bool:
-        """Warp thermal frame onto canvas — pure override semantics.
+        """Warp thermal frame onto canvas.
 
-        The camera's current FOV always updates the canvas (last-write-wins).
-        Previously seen but currently invisible areas are preserved untouched.
-        No edge mask — eliminates frame-border artifacts.
+        - Unvisited pixels: write directly (first visit)
+        - Already visited pixels: soft blend (0.3 old + 0.7 new) for smooth seams
         """
         ch, cw = self._canvas.shape
         H_c = self._H_offset @ H_acc
@@ -248,14 +247,22 @@ class CanvasManager:
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT, borderValue=0,
         )
-        write_mask = warped > 0
+        new_data = warped > 0
 
-        if not write_mask.any():
+        if not new_data.any():
             return False
 
-        # Pure override: camera's current FOV always updates the canvas
-        self._canvas[write_mask] = warped[write_mask]
-        self._visited[write_mask] = True
+        # First visit: write directly
+        first_visit = new_data & ~self._visited
+        self._canvas[first_visit] = warped[first_visit]
+        self._visited[first_visit] = True
+
+        # Revisit: soft blend to smooth seams (70% new, 30% old)
+        revisit = new_data & self._visited & ~first_visit
+        if revisit.any():
+            self._canvas[revisit] = (0.7 * warped[revisit] +
+                                     0.3 * self._canvas[revisit])
+
         return True
 
     def expand_if_needed(self, margin: int = 50) -> None:
@@ -301,6 +308,9 @@ class HeatMapRenderer:
         denom = max(self._maxv - self._minv, 1)
         stretched = ((np.clip(canvas_f32, self._minv, self._maxv) - self._minv)
                      * (255.0 / denom)).astype(np.uint8)
+        # Smooth to reduce stitching seams at frame boundaries
+        stretched = cv2.GaussianBlur(stretched, (7, 7), 2)
+        stretched[~valid] = 0
         colored = cv2.applyColorMap(stretched, cv2.COLORMAP_JET)
         colored[~valid] = [0, 0, 0]
         return colored
