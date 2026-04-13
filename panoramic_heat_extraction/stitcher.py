@@ -56,7 +56,7 @@ class PanoramaConfig:
     akaze_threshold: float = 0.001
     ransac_threshold: float = 5.0
     min_inliers: int = 10
-    canvas_padding_factor: int = 3
+    canvas_padding_factor: int = 5
     blend_width: int = 32
     bundle_adjust_interval: int = 20
 
@@ -71,8 +71,8 @@ class PanoramaConfig:
     # Hybrid stitching — override + edge-catching
     overlap_margin_px: int = 20        # extra pixels beyond edge mask for vibration
     rotation_threshold_deg: float = 5.0  # above this → fallback to unvisited-only
-    max_move_px: float = 80.0          # above this → reject frame (bad match/shake)
-    min_move_px: float = 8.0           # below this → skip (robot not moving enough)
+    max_move_px: float = 400.0         # above this → reject frame (bad match/shake)
+    min_move_px: float = 5.0           # below this → skip (robot not moving enough)
 
     # Output
     output_dir: Path = OUTPUT_DIR
