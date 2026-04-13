@@ -77,7 +77,7 @@ def test_no_overlap_side_by_side():
     assert new_pixels.sum() > 0, "Frame B should have written some pixels"
 
 def test_vibration_fallback():
-    """angle > threshold should use unvisited-only mode (no edge mask)."""
+    """With pure override, rotation doesn't matter — camera FOV always updates canvas."""
     cm = CanvasManager(100, 100, padding_factor=3,
                        overlap_margin_px=10, rotation_threshold_deg=5.0)
     frame_a = np.full((100, 100), 80, dtype=np.uint8)
@@ -85,12 +85,13 @@ def test_vibration_fallback():
 
     frame_b = np.full((100, 100), 150, dtype=np.uint8)
     H_identity = np.eye(3, dtype=np.float64)
-    # angle=10° > threshold=5° → fallback to unvisited-only
-    # Since all pixels are already visited, nothing should be written
+    # angle=10° — with pure override, still writes (camera FOV always updates)
     ok = cm.warp_and_blend(frame_b, H_identity, tx=0.0, ty=0.0, angle_deg=10.0)
-    # No unvisited pixels + no edge mask → nothing written
-    assert not ok, "With rotation fallback and all pixels visited, nothing should be written"
-    print(f"  vibration_fallback: ok={ok} (expected False) ✓")
+    assert ok, "Pure override should always write when warped has data"
+    # Value should be updated to 150
+    cropped = cm.get_cropped()
+    assert abs(cropped[50, 50] - 150.0) < 1.0, f"Expected 150, got {cropped[50,50]}"
+    print(f"  vibration_pure_override: ok={ok}, center={cropped[50,50]:.1f} ✓")
 
 if __name__ == "__main__":
     print("=== Hybrid Stitcher Tests ===")

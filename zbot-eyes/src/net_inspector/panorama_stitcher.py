@@ -177,7 +177,7 @@ class CanvasManager:
     def warp_and_blend(self, thermal_gray: np.ndarray, H_accumulated: np.ndarray,
                        tx: float = 0.0, ty: float = 0.0,
                        angle_deg: float = 0.0) -> bool:
-        """Warp thermal frame onto canvas using override + edge-catching."""
+        """Warp thermal frame onto canvas — pure override semantics."""
         ch, cw = self._canvas.shape
         H_canvas = self._H_offset @ H_accumulated
 
@@ -185,24 +185,7 @@ class CanvasManager:
             thermal_gray.astype(np.float32), H_canvas, (cw, ch),
             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
         )
-        warped_has_data = warped > 0
-
-        if not warped_has_data.any():
-            return False
-
-        if abs(angle_deg) < self._rot_threshold:
-            frame_edge_mask = self._compute_edge_mask(tx, ty)
-            edge_canvas = cv2.warpPerspective(
-                frame_edge_mask.astype(np.uint8), H_canvas, (cw, ch),
-                flags=cv2.INTER_NEAREST,
-                borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-            ).astype(bool)
-            edge_write = edge_canvas & warped_has_data
-        else:
-            edge_write = np.zeros((ch, cw), dtype=bool)
-
-        unvisited_write = ~self._visited & warped_has_data
-        write_mask = edge_write | unvisited_write
+        write_mask = warped > 0
 
         if not write_mask.any():
             return False

@@ -230,15 +230,11 @@ class CanvasManager:
     def warp_and_blend(self, gray: np.ndarray, H_acc: np.ndarray,
                        tx: float = 0.0, ty: float = 0.0,
                        angle_deg: float = 0.0) -> bool:
-        """Warp thermal frame onto canvas using override + edge-catching.
+        """Warp thermal frame onto canvas — pure override semantics.
 
-        Args:
-            gray: thermal grayscale frame
-            H_acc: accumulated 3×3 affine homography to canvas
-            tx, ty: translation from AKAZE (frame-space pixels)
-            angle_deg: rotation angle from AKAZE transform
-
-        Returns True if any pixels were written.
+        The camera's current FOV always updates the canvas (last-write-wins).
+        Previously seen but currently invisible areas are preserved untouched.
+        No edge mask — eliminates frame-border artifacts.
         """
         ch, cw = self._canvas.shape
         H_c = self._H_offset @ H_acc
@@ -248,38 +244,12 @@ class CanvasManager:
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT, borderValue=0,
         )
-        warped_has_data = warped > 0
-
-        if not warped_has_data.any():
-            return False
-
-        # --- Build write mask ---
-        if abs(angle_deg) < self._rot_threshold:
-            # Normal case: use edge-catching mask
-            frame_edge_mask = self._compute_edge_mask(tx, ty)
-
-            # Warp the frame-space edge mask to canvas coordinates
-            edge_canvas = cv2.warpPerspective(
-                frame_edge_mask.astype(np.uint8), H_c, (cw, ch),
-                flags=cv2.INTER_NEAREST,
-                borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-            ).astype(bool)
-
-            edge_write = edge_canvas & warped_has_data
-        else:
-            # Significant rotation → only write unvisited pixels
-            edge_write = np.zeros((ch, cw), dtype=bool)
-
-        # Always write unvisited pixels (first-visit guarantee)
-        unvisited_write = ~self._visited & warped_has_data
-
-        # Combined write mask
-        write_mask = edge_write | unvisited_write
+        write_mask = warped > 0
 
         if not write_mask.any():
             return False
 
-        # Override write — last write wins, no blending
+        # Pure override: camera's current FOV always updates the canvas
         self._canvas[write_mask] = warped[write_mask]
         self._visited[write_mask] = True
         return True
