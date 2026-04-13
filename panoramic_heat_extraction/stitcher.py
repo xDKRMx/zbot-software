@@ -98,11 +98,11 @@ class FramePair:
 # ---------------------------------------------------------------------------
 
 class FeatureAligner:
-    """Uses estimateAffinePartial2D (translation + rotation + uniform scale only).
+    """Translation-only feature aligner.
 
-    This is the correct model for a camera panning across a flat surface.
-    Full homography causes the "ray burst" artifact when the camera rotates
-    because it tries to model perspective that doesn't exist.
+    Extracts only (tx, ty) from AKAZE matches, discards rotation and scale.
+    This prevents drift accumulation — correct for a robot that only
+    translates on a flat wall surface.
     """
 
     def __init__(self, akaze_threshold: float = 0.001,
@@ -114,7 +114,7 @@ class FeatureAligner:
 
     def compute_homography(self, rgb_prev: np.ndarray,
                            rgb_curr: np.ndarray) -> tuple[Optional[np.ndarray], int]:
-        """Returns a 3×3 matrix (affine embedded in homogeneous coords) or None."""
+        """Returns a 3×3 pure-translation matrix or None."""
         g1 = cv2.cvtColor(rgb_prev, cv2.COLOR_BGR2GRAY)
         g2 = cv2.cvtColor(rgb_curr, cv2.COLOR_BGR2GRAY)
         kp1, des1 = self._akaze.detectAndCompute(g1, None)
@@ -133,7 +133,6 @@ class FeatureAligner:
         src = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
         dst = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
 
-        # Affine partial: only translation + rotation + uniform scale (no shear, no perspective)
         M, mask = cv2.estimateAffinePartial2D(
             src, dst,
             method=cv2.RANSAC,
@@ -147,9 +146,14 @@ class FeatureAligner:
         if inliers < self._min_inliers:
             return None, inliers
 
-        # Embed 2×3 affine into 3×3 homogeneous matrix
-        H = np.eye(3, dtype=np.float64)
-        H[:2, :] = M.astype(np.float64)
+        # Extract only translation — discard rotation and scale to prevent drift
+        tx = float(M[0, 2])
+        ty = float(M[1, 2])
+
+        # Pure translation matrix
+        H = np.array([[1.0, 0.0, tx],
+                      [0.0, 1.0, ty],
+                      [0.0, 0.0, 1.0]], dtype=np.float64)
         return H, inliers
 
 

@@ -45,13 +45,13 @@ class FramePair:
 # ---------------------------------------------------------------------------
 
 class FeatureAligner:
-    """AKAZE-based feature extraction, matching, and homography estimation."""
+    """Translation-only feature aligner — extracts only (tx, ty), discards rotation/scale."""
 
     def __init__(
         self,
         akaze_threshold: float = 0.001,
         ransac_threshold: float = 5.0,
-        min_inliers: int = 10,
+        min_inliers: int = 6,
     ) -> None:
         self._akaze = cv2.AKAZE_create(threshold=akaze_threshold)
         self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
@@ -61,22 +61,17 @@ class FeatureAligner:
     def compute_homography(
         self, rgb_prev: np.ndarray, rgb_curr: np.ndarray,
     ) -> tuple[Optional[np.ndarray], int]:
-        """Compute homography from *rgb_prev* to *rgb_curr*.
-
-        Returns (H, inlier_count).  H is None when matching fails.
-        """
+        """Returns a 3×3 pure-translation matrix or None."""
         gray_prev = cv2.cvtColor(rgb_prev, cv2.COLOR_BGR2GRAY)
         gray_curr = cv2.cvtColor(rgb_curr, cv2.COLOR_BGR2GRAY)
 
         kp1, des1 = self._akaze.detectAndCompute(gray_prev, None)
         kp2, des2 = self._akaze.detectAndCompute(gray_curr, None)
 
-        if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
+        if des1 is None or des2 is None or len(kp1) < 3 or len(kp2) < 3:
             return None, 0
 
         raw_matches = self._matcher.knnMatch(des1, des2, k=2)
-
-        # Lowe's ratio test
         good = []
         for pair in raw_matches:
             if len(pair) == 2:
@@ -84,21 +79,32 @@ class FeatureAligner:
                 if m.distance < 0.75 * n.distance:
                     good.append(m)
 
-        if len(good) < 4:
+        if len(good) < 3:
             return None, len(good)
 
         src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
         dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
 
-        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, self._ransac_threshold)
+        M, mask = cv2.estimateAffinePartial2D(
+            src_pts, dst_pts,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=self._ransac_threshold,
+        )
 
-        if H is None or mask is None:
+        if M is None or mask is None:
             return None, 0
 
         inlier_count = int(mask.sum())
         if inlier_count < self._min_inliers:
             return None, inlier_count
 
+        # Extract only translation — discard rotation and scale to prevent drift
+        tx = float(M[0, 2])
+        ty = float(M[1, 2])
+
+        H = np.array([[1.0, 0.0, tx],
+                      [0.0, 1.0, ty],
+                      [0.0, 0.0, 1.0]], dtype=np.float64)
         return H, inlier_count
 
 
