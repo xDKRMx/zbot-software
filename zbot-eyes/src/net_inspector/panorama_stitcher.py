@@ -479,7 +479,11 @@ class PanoramaStitcher:
             alt_prev = self._stitched[-2]
             H, inliers = self._aligner.compute_homography(alt_prev.rgb, fp.rgb)
             if H is not None and alt_prev.H_to_canvas is not None:
-                self._H_acc = alt_prev.H_to_canvas @ H
+                alt_tx = float(H[0, 2])
+                alt_ty = float(H[1, 2])
+                self._H_acc = alt_prev.H_to_canvas.copy()
+                self._H_acc[0, 2] -= alt_tx
+                self._H_acc[1, 2] -= alt_ty
                 fp.low_confidence = True
                 self._low_conf_count += 1
 
@@ -488,31 +492,28 @@ class PanoramaStitcher:
             print(f"[PANORAMA] Frame {fp.seq_id} skipped (inliers={inliers}).")
             return
 
-        # Extract movement info from H (frame-space)
         tx = float(H[0, 2])
         ty = float(H[1, 2])
-        angle_deg = math.degrees(math.atan2(float(H[1, 0]), float(H[0, 0])))
         move = math.sqrt(tx**2 + ty**2)
 
-        # Reject bad matches
         if move > self._cfg.max_move_px:
             self._frames_skipped += 1
             print(f"[PANORAMA] Frame {fp.seq_id} rejected: move={move:.1f}px > max={self._cfg.max_move_px}")
             return
 
-        # Silent skip if robot hasn't moved
         if move < self._cfg.min_move_px:
             return
 
         if not fp.low_confidence:
-            self._H_acc = self._H_acc @ H
+            self._H_acc[0, 2] += tx
+            self._H_acc[1, 2] += ty
 
         fp.H_to_canvas = self._H_acc.copy()
         fp.inlier_count = inliers
         self._total_inliers += inliers
 
         self._canvas_mgr.expand_if_needed()
-        ok = self._canvas_mgr.warp_and_blend(thermal, self._H_acc, tx, ty, angle_deg)
+        ok = self._canvas_mgr.warp_and_blend(thermal, self._H_acc)
         if ok:
             self._frames_stitched += 1
             self._stitched.append(fp)
