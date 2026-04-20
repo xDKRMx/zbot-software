@@ -21,7 +21,103 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (z-bot-map integration)
+# ---------------------------------------------------------------------------
+
+def normalize_percentile_map(src: np.ndarray, percentile: float = 95.0) -> np.ndarray:
+    """Normalize a map using percentile scaling."""
+    scale = float(np.percentile(src, percentile))
+    if scale <= 1e-6 or not np.isfinite(scale):
+        return np.zeros_like(src, dtype=np.float32)
+    return np.clip(src / scale, 0.0, 1.0).astype(np.float32)
+
+
+def compute_detail_score_map(image_bgr: np.ndarray) -> np.ndarray:
+    """Estimate soft detail/saliency map for adaptive blending.
+    
+    From z-bot-map by Lennart A. Conrad.
+    Flat regions get low scores (safe to feather).
+    Edge regions get high scores (keep single crisp observation).
+    """
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = cv2.magnitude(grad_x, grad_y)
+    lap_abs = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
+    local_contrast = np.abs(gray - cv2.GaussianBlur(gray, (0, 0), 2.0))
+    
+    score = (
+        0.55 * normalize_percentile_map(grad_mag)
+        + 0.25 * normalize_percentile_map(lap_abs)
+        + 0.20 * normalize_percentile_map(local_contrast)
+    )
+    score = cv2.GaussianBlur(score, (0, 0), 2.0)
+    score = cv2.dilate(score, np.ones((9, 9), dtype=np.uint8), iterations=1)
+    return np.clip(score, 0.0, 1.0).astype(np.float32)
+
+
+def compute_feather_weight(size_wh: tuple[int, int]) -> np.ndarray:
+    """Compute distance-from-edge feather weight map."""
+    width, height = size_wh
+    y_grid, x_grid = np.ogrid[:height, :width]
+    x_center, y_center = width / 2.0, height / 2.0
+    
+    dist_x = np.minimum(x_grid, width - 1 - x_grid).astype(np.float32) / x_center
+    dist_y = np.minimum(y_grid, height - 1 - y_grid).astype(np.float32) / y_center
+    dist = np.minimum(dist_x, dist_y)
+    
+    if dist.max() > 0:
+        dist = dist / dist.max()
+    dist = np.clip(dist, 1e-3, 1.0)
+    return dist.astype(np.float32)
+
+
+def compute_frame_sharpness(gray: np.ndarray) -> float:
+    """Compute frame sharpness using Laplacian variance.
+    
+    Motion blur detection - low sharpness = skip frame.
+    """
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    variance = float(laplacian.var())
+    return variance
+
+
+def compute_frame_quality(
+    gray: np.ndarray,
+    inliers: int,
+    move_px: float,
+    min_sharpness: float = 10.0,
+    max_move_px: float = 400.0
+) -> tuple[float, str]:
+    """Compute frame quality for blend weighting (z-bot-map style).
+    
+    Quality score affects blend weight, NOT frame acceptance.
+    Lower quality = lower contribution in overlap regions.
+    
+    Returns:
+        quality: 0.0-1.0 (1.0 = best)
+        reason: Quality assessment reason
+    """
+    # 1. Sharpness score (permissive - webcam typically 20-60)
+    sharpness = compute_frame_sharpness(gray)
+    sharpness_score = np.clip(sharpness / 300.0, 0.1, 1.0)  # Min 0.1 (always contribute)
+    
+    # 2. Tracking confidence (inlier quality)
+    inlier_score = np.clip(inliers / 30.0, 0.2, 1.0)  # Min 0.2
+    
+    # 3. Motion speed factor (slower = better)
+    motion_score = np.clip(1.0 - (move_px / max_move_px) * 0.5, 0.3, 1.0)  # Min 0.3
+    
+    # Combined quality (permissive - always >= 0.2)
+    quality = 0.4 * sharpness_score + 0.3 * inlier_score + 0.3 * motion_score
+    quality = float(np.clip(quality, 0.2, 1.0))  # Never below 0.2
+    
+    reason = f"sharp={sharpness:.0f}, inliers={inliers}, move={move_px:.1f}px"
+    return quality, reason
+
+
+# ---------------------------------------------------------------------------
+# Original Helpers
 # ---------------------------------------------------------------------------
 
 def ensure_dir(p: Path) -> None:
@@ -53,9 +149,14 @@ class PanoramaConfig:
     capture_fps: float = 5.0      # how many frames/sec to stitch
 
     # Stitching
-    akaze_threshold: float = 0.0001  # Not used (ORB detector now)
+    detector_type: str = "orb"  # orb or sift (z-bot-map)
+    akaze_threshold: float = 0.0001  # Not used (ORB/SIFT detector now)
     ransac_threshold: float = 5.0
     min_inliers: int = 3  # ORB detector optimized for thermal (was 4)
+    use_ecc_fallback: bool = True  # z-bot-map ECC refinement
+    blend_mode: str = "best"  # best, soft, or simple (z-bot-map integration)
+    min_sharpness: float = 10.0  # Motion blur threshold (skip blurry frames)
+    motion_quality_threshold: float = 0.0  # Skip frames below this quality
     canvas_padding_factor: int = 5
     blend_width: int = 32
     bundle_adjust_interval: int = 20
@@ -98,23 +199,39 @@ class FramePair:
 # ---------------------------------------------------------------------------
 
 class FeatureAligner:
-    """Translation-only feature aligner.
+    """Translation-only feature aligner with z-bot-map enhancements.
 
     Extracts only (tx, ty) from feature matches, discards rotation and scale.
     This prevents drift accumulation — correct for a robot that only
     translates on a flat wall surface.
     
-    Uses ORB detector for thermal images (better than AKAZE for low-res thermal).
+    z-bot-map integration:
+    - SIFT detector option (better for some thermal scenes)
+    - ECC fallback when descriptor matching fails
     """
 
-    def __init__(self, akaze_threshold: float = 0.0001,
-                 ransac_threshold: float = 5.0, min_inliers: int = 3) -> None:
-        # ORB detector - much better for thermal low-res images
-        self._detector = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8)
-        self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    def __init__(self, detector_type: str = "orb",
+                 ransac_threshold: float = 5.0, min_inliers: int = 3,
+                 use_ecc: bool = True) -> None:
+        # Detector selection: ORB (fast) or SIFT (more features)
+        if detector_type == "sift":
+            if hasattr(cv2, "SIFT_create"):
+                self._detector = cv2.SIFT_create(nfeatures=2000)
+                self._norm = cv2.NORM_L2
+                print("[FEATURE] Using SIFT detector (z-bot-map style)")
+            else:
+                print("[FEATURE] SIFT unavailable, falling back to ORB")
+                self._detector = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8)
+                self._norm = cv2.NORM_HAMMING
+        else:
+            self._detector = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8)
+            self._norm = cv2.NORM_HAMMING
+        
+        self._matcher = cv2.BFMatcher(self._norm, crossCheck=False)
         self._ransac_threshold = ransac_threshold
         self._min_inliers = min_inliers
-        # CLAHE for thermal contrast enhancement - BOOSTED for thermal
+        self._use_ecc = use_ecc
+        # CLAHE for thermal contrast enhancement
         self._clahe = cv2.createCLAHE(clipLimit=8.0, tileGridSize=(8, 8))
 
     def compute_homography(self, rgb_prev: np.ndarray,
@@ -137,6 +254,9 @@ class FeatureAligner:
 
         if des1 is None or des2 is None or len(kp1) < 3 or len(kp2) < 3:
             print(f"[FEATURE] SKIP: kp1={len(kp1) if kp1 else 0}, kp2={len(kp2) if kp2 else 0}, des1={des1 is not None}, des2={des2 is not None}")
+            # z-bot-map ECC fallback for low-texture scenes
+            if self._use_ecc:
+                return self._ecc_fallback(g1, g2)
             return None, 0
 
         raw = self._matcher.knnMatch(des1, des2, k=2)
@@ -175,6 +295,43 @@ class FeatureAligner:
                       [0.0, 1.0, ty],
                       [0.0, 0.0, 1.0]], dtype=np.float64)
         return H, inliers
+    
+    def _ecc_fallback(self, gray1: np.ndarray, gray2: np.ndarray) -> tuple[Optional[np.ndarray], int]:
+        """ECC (Enhanced Correlation Coefficient) fallback from z-bot-map.
+        
+        When descriptor matching fails (low texture), use ECC alignment.
+        """
+        warp_matrix = np.eye(2, 3, dtype=np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 1e-3)
+        
+        try:
+            cc, warp_matrix = cv2.findTransformECC(
+                gray1, gray2,
+                warp_matrix,
+                cv2.MOTION_EUCLIDEAN,
+                criteria,
+                gaussFiltSize=5
+            )
+            
+            if cc < 0.5:  # Low correlation
+                print(f"[ECC] SKIP: correlation={cc:.3f} too low")
+                return None, 0
+            
+            # Extract translation from 2x3 matrix
+            tx = float(warp_matrix[0, 2])
+            ty = float(warp_matrix[1, 2])
+            
+            # Pure translation homography
+            H = np.array([[1.0, 0.0, tx],
+                         [0.0, 1.0, ty],
+                         [0.0, 0.0, 1.0]], dtype=np.float64)
+            
+            print(f"[ECC] SUCCESS: cc={cc:.3f}, tx={tx:.1f}, ty={ty:.1f}")
+            return H, 0  # inliers unknown for ECC
+            
+        except cv2.error as e:
+            print(f"[ECC] FAIL: {e}")
+            return None, 0
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +350,8 @@ class CanvasManager:
 
     def __init__(self, frame_h: int, frame_w: int, padding_factor: int = 3,
                  overlap_margin_px: int = 20,
-                 rotation_threshold_deg: float = 5.0) -> None:
+                 rotation_threshold_deg: float = 5.0,
+                 blend_mode: str = "best") -> None:
         ch, cw = frame_h * padding_factor, frame_w * padding_factor
         self._canvas = np.zeros((ch, cw), dtype=np.float32)
         self._visited = np.zeros((ch, cw), dtype=bool)   # True = written at least once
@@ -206,6 +364,14 @@ class CanvasManager:
         self._rot_threshold = rotation_threshold_deg
         self._frame_h = frame_h
         self._frame_w = frame_w
+        self._blend_mode = blend_mode
+        
+        # z-bot-map best blend tracking
+        if blend_mode == "best":
+            self._detail_score = np.zeros((ch, cw), dtype=np.float32)
+            print(f"[CANVAS] Using 'best' blend mode (z-bot-map)")
+        else:
+            self._detail_score = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -253,11 +419,15 @@ class CanvasManager:
 
     def warp_and_blend(self, gray: np.ndarray, H_acc: np.ndarray,
                        tx: float = 0.0, ty: float = 0.0,
-                       angle_deg: float = 0.0) -> bool:
+                       angle_deg: float = 0.0,
+                       gray_bgr: Optional[np.ndarray] = None,
+                       frame_quality: float = 1.0) -> bool:
         """Warp thermal frame onto canvas.
-
-        - Unvisited pixels: write directly (first visit)
-        - Already visited pixels: soft blend (0.3 old + 0.7 new) for smooth seams
+        
+        Blend modes:
+        - best: z-bot-map detail-based selection (crisp edges)
+        - soft: weighted blend (smooth seams)
+        - simple: last-write-wins
         """
         ch, cw = self._canvas.shape
         H_c = self._H_offset @ H_acc
@@ -276,14 +446,53 @@ class CanvasManager:
         first_visit = new_data & ~self._visited
         self._canvas[first_visit] = warped[first_visit]
         self._visited[first_visit] = True
-
-        # Revisit: soft blend to smooth seams (70% new, 30% old)
-        revisit = new_data & self._visited & ~first_visit
-        if revisit.any():
-            self._canvas[revisit] = (0.7 * warped[revisit] +
-                                     0.3 * self._canvas[revisit])
+        
+        if self._blend_mode == "best" and self._detail_score is not None:
+            # z-bot-map best blend: select best pixel based on detail + quality
+            self._blend_best(gray, gray_bgr, H_c, warped, new_data, frame_quality)
+        elif self._blend_mode == "soft":
+            # Soft blend: weighted average for smooth seams
+            revisit = new_data & self._visited & ~first_visit
+            if revisit.any():
+                self._canvas[revisit] = (0.7 * warped[revisit] +
+                                         0.3 * self._canvas[revisit])
+        # else: simple mode - first_visit already written, no overlap blend
 
         return True
+    
+    def _blend_best(self, gray: np.ndarray, gray_bgr: Optional[np.ndarray],
+                    H_c: np.ndarray, warped: np.ndarray, 
+                    new_data: np.ndarray, frame_quality: float) -> None:
+        """z-bot-map best blend: pick best observation per pixel."""
+        ch, cw = self._canvas.shape
+        
+        # Compute detail score for this frame
+        if gray_bgr is not None:
+            detail_map = compute_detail_score_map(gray_bgr)
+        else:
+            # Fallback: use gradient magnitude on grayscale
+            gray_norm = (gray / gray.max() * 255).astype(np.uint8) if gray.max() > 0 else gray
+            gray_3ch = cv2.cvtColor(gray_norm, cv2.COLOR_GRAY2BGR)
+            detail_map = compute_detail_score_map(gray_3ch)
+        
+        # Feather weight (center > edges)
+        feather = compute_feather_weight((gray.shape[1], gray.shape[0]))
+        
+        # Combine detail + feather + quality
+        selection_score = detail_map * feather * frame_quality
+        
+        # Warp detail score
+        warped_score = cv2.warpPerspective(
+            selection_score.astype(np.float32), H_c, (cw, ch),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0
+        )
+        
+        # Update pixels where new frame has better detail
+        better_mask = new_data & (warped_score > self._detail_score)
+        if better_mask.any():
+            self._canvas[better_mask] = warped[better_mask]
+            self._detail_score[better_mask] = warped_score[better_mask]
 
     def expand_if_needed(self, margin: int = 50) -> None:
         """Expand canvas if content is within margin pixels of any edge."""
@@ -355,8 +564,12 @@ class PanoramaStitcher:
     def __init__(self, config: PanoramaConfig,
                  on_update: Optional[Callable[[np.ndarray], None]] = None) -> None:
         self._cfg = config
-        self._aligner = FeatureAligner(config.akaze_threshold,
-                                       config.ransac_threshold, config.min_inliers)
+        self._aligner = FeatureAligner(
+            detector_type=config.detector_type,
+            ransac_threshold=config.ransac_threshold,
+            min_inliers=config.min_inliers,
+            use_ecc=config.use_ecc_fallback
+        )
         self._renderer = HeatMapRenderer(config.thermal_minv, config.thermal_maxv)
         self._canvas_mgr: Optional[CanvasManager] = None
         self._on_update = on_update  # called with colorized preview after each stitch
@@ -475,6 +688,7 @@ class PanoramaStitcher:
                 padding_factor=self._cfg.canvas_padding_factor,
                 overlap_margin_px=self._cfg.overlap_margin_px,
                 rotation_threshold_deg=self._cfg.rotation_threshold_deg,
+                blend_mode=self._cfg.blend_mode,  # z-bot-map integration
             )
             self._canvas_mgr.place_first(thermal)
             fp.H_to_canvas = np.eye(3, dtype=np.float64)
@@ -532,12 +746,31 @@ class PanoramaStitcher:
         self._total_inliers += inliers
 
         self._canvas_mgr.expand_if_needed()
-        ok = self._canvas_mgr.warp_and_blend(thermal, self._H_acc)
+        
+        # Compute frame quality for blend weighting (z-bot-map style)
+        # NOTE: Quality affects BLEND weight, NOT frame skip decision
+        gray_for_quality = cv2.cvtColor(fp.rgb, cv2.COLOR_BGR2GRAY) if fp.rgb is not None else thermal
+        frame_quality, quality_reason = compute_frame_quality(
+            gray_for_quality,
+            inliers=inliers,
+            move_px=move,
+            min_sharpness=10.0,  # Very permissive (webcam ~20-40 typical)
+            max_move_px=self._cfg.max_move_px
+        )
+        
+        # z-bot-map: pass BGR frame for detail analysis (if available)
+        gray_bgr = fp.rgb if fp.rgb is not None else None
+        ok = self._canvas_mgr.warp_and_blend(
+            thermal, self._H_acc, 
+            tx=tx, ty=ty, angle_deg=0.0,
+            gray_bgr=gray_bgr,
+            frame_quality=frame_quality  # Used for blend weight only
+        )
         if ok:
             self.frames_stitched += 1
             self._stitched.append(fp)
             self._prev = fp
-            print(f"[STITCH] Frame {fp.seq_id} SUCCESS: inliers={inliers}, move={move:.1f}px (total stitched={self.frames_stitched})")
+            print(f"[STITCH] Frame {fp.seq_id} SUCCESS: inliers={inliers}, move={move:.1f}px, Q={frame_quality:.2f} | total={self.frames_stitched}")
             self._notify_update()
             if (self.frames_stitched % self._cfg.bundle_adjust_interval == 0
                     and self.frames_stitched > self._cfg.bundle_adjust_interval):
