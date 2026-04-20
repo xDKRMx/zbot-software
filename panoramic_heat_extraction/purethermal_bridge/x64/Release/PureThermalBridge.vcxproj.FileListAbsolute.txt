@@ -1,0 +1,1 @@
+C:\WallNet Detection\panoramic_heat_extraction\purethermal_bridge\x64\Release\PureThermalBridge.dll

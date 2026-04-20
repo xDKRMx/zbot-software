@@ -22,6 +22,13 @@ import numpy as np
 from net_inspector.config import PanoramaConfig, OUTPUT_DIR
 from net_inspector.utils.io import ensure_dir, save_image, timestamp_id
 
+# Relocalization constants
+MIN_RELOCALIZE_MATCHES = 20      # Minimum feature matches to attempt relocalization
+MIN_RELOCALIZE_INLIERS = 15      # Minimum inliers to accept relocalization
+KEYFRAME_DISTANCE_THRESHOLD = 100.0  # px - add keyframe if moved this far
+KEYFRAME_TIME_THRESHOLD = 2.0    # seconds - add keyframe if this much time passed
+MAX_KEYFRAMES = 200              # Maximum keyframes to store
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -35,9 +42,34 @@ class FramePair:
     timestamp: float
     rgb: np.ndarray
     thermal_gray: np.ndarray
-    H_to_canvas: Optional[np.ndarray] = None
+    H_to_global: Optional[np.ndarray] = None  # Renamed from H_to_canvas for clarity
     inlier_count: int = 0
     low_confidence: bool = False
+    features: Optional[tuple] = None  # (keypoints, descriptors) for relocalization
+
+
+@dataclass
+class Keyframe:
+    """Keyframe for relocalization - stores spatial position in global coordinates."""
+
+    id: int
+    seq_id: int
+    timestamp: float
+    rgb: np.ndarray              # RGB image for feature matching
+    thermal: np.ndarray          # Thermal data
+    H_to_global: np.ndarray      # Transform to global coordinate system
+    keypoints: tuple             # cv2.KeyPoint list
+    descriptors: np.ndarray      # AKAZE descriptors
+    canvas_bbox: tuple[int, int, int, int]  # (x1, y1, x2, y2) on canvas
+
+
+@dataclass
+class KeyframeMatch:
+    """Result of relocalization attempt."""
+
+    kf_id: int
+    H_match: np.ndarray
+    inliers: int
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +90,16 @@ class FeatureAligner:
         self._ransac_threshold = ransac_threshold
         self._min_inliers = min_inliers
 
+    def extract_features(self, rgb: np.ndarray) -> tuple[tuple, Optional[np.ndarray]]:
+        """Extract AKAZE features from RGB image.
+        
+        Returns:
+            (keypoints, descriptors) - keypoints as tuple, descriptors as ndarray or None
+        """
+        gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
+        kp, des = self._akaze.detectAndCompute(gray, None)
+        return (tuple(kp) if kp else tuple(), des)
+    
     def compute_homography(
         self, rgb_prev: np.ndarray, rgb_curr: np.ndarray,
     ) -> tuple[Optional[np.ndarray], int]:
@@ -183,7 +225,11 @@ class CanvasManager:
     def warp_and_blend(self, thermal_gray: np.ndarray, H_accumulated: np.ndarray,
                        tx: float = 0.0, ty: float = 0.0,
                        angle_deg: float = 0.0) -> bool:
-        """Warp thermal frame onto canvas — pure override semantics."""
+        """Warp thermal frame onto canvas with soft blending for smooth seams.
+        
+        - Unvisited pixels: write directly (first visit)
+        - Already visited pixels: soft blend (70% new + 30% old) for smooth seams
+        """
         ch, cw = self._canvas.shape
         H_canvas = self._H_offset @ H_accumulated
 
@@ -191,13 +237,22 @@ class CanvasManager:
             thermal_gray.astype(np.float32), H_canvas, (cw, ch),
             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
         )
-        write_mask = warped > 0
+        new_data = warped > 0
 
-        if not write_mask.any():
+        if not new_data.any():
             return False
 
-        self._canvas[write_mask] = warped[write_mask]
-        self._visited[write_mask] = True
+        # First visit: write directly
+        first_visit = new_data & ~self._visited
+        self._canvas[first_visit] = warped[first_visit]
+        self._visited[first_visit] = True
+
+        # Revisit: soft blend to smooth seams (70% new, 30% old)
+        revisit = new_data & self._visited & ~first_visit
+        if revisit.any():
+            self._canvas[revisit] = (0.7 * warped[revisit] +
+                                     0.3 * self._canvas[revisit])
+
         return True
 
     def expand_if_needed(self, margin: int = 50) -> bool:
@@ -262,6 +317,10 @@ class HeatMapRenderer:
         denom = max(self._maxv - self._minv, 1)
         stretched = ((clipped - self._minv) * (255.0 / denom)).astype(np.uint8)
 
+        # Smooth to reduce stitching seams at frame boundaries
+        stretched = cv2.GaussianBlur(stretched, (7, 7), 2)
+        stretched[~valid_mask] = 0
+
         colored = cv2.applyColorMap(stretched, cv2.COLORMAP_JET)
         colored[~valid_mask] = [0, 0, 0]
         return colored
@@ -318,15 +377,22 @@ class PanoramaStitcher:
         self._frame_queue: queue.Queue[FramePair] = queue.Queue(maxsize=config.max_frames)
         self._seq = 0
         self._prev: Optional[FramePair] = None
-        self._H_acc = np.eye(3, dtype=np.float64)
+        self._H_to_global = np.eye(3, dtype=np.float64)  # Renamed from _H_acc
         self._stitched: list[FramePair] = []
+        
+        # Keyframe database for relocalization
+        self._keyframes: list[Keyframe] = []
+        self._kf_id_counter = 0
+        self._last_keyframe_pos = np.array([0.0, 0.0])  # Track last keyframe position
+        self._last_keyframe_time = 0.0
 
-        # Stats
-        self._frames_stitched = 0
-        self._frames_skipped = 0
+        # Stats (public for GUI access)
+        self.frames_stitched = 0
+        self.frames_skipped = 0
+        self.drift_corrections = 0
+        self.relocalizations = 0  # Track successful relocalizations
         self._low_conf_count = 0
         self._total_inliers = 0
-        self._drift_corrections = 0
         self._start_time = 0.0
 
         self._alive = False
@@ -406,17 +472,17 @@ class PanoramaStitcher:
 
         # Metadata
         duration = time.time() - self._start_time if self._start_time else 0.0
-        avg_inliers = (self._total_inliers / max(self._frames_stitched, 1))
+        avg_inliers = (self._total_inliers / max(self.frames_stitched, 1))
         meta = {
             "total_frames": self._seq,
-            "frames_stitched": self._frames_stitched,
-            "frames_skipped": self._frames_skipped,
+            "frames_stitched": self.frames_stitched,
+            "frames_skipped": self.frames_skipped,
             "canvas_width": int(cropped.shape[1]),
             "canvas_height": int(cropped.shape[0]),
             "duration_s": round(duration, 2),
             "low_confidence_count": self._low_conf_count,
             "avg_inliers": round(avg_inliers, 1),
-            "drift_corrections": self._drift_corrections,
+            "drift_corrections": self.drift_corrections,
             "timestamp_start": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._start_time)),
             "timestamp_end": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -424,8 +490,8 @@ class PanoramaStitcher:
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
         print(f"[PANORAMA] Exported → {full_path}")
-        print(f"[PANORAMA]   stitched={self._frames_stitched}  skipped={self._frames_skipped}  "
-              f"drift_corrections={self._drift_corrections}")
+        print(f"[PANORAMA]   stitched={self.frames_stitched}  skipped={self.frames_skipped}  "
+              f"drift_corrections={self.drift_corrections}")
         return full_path
 
     # -- worker thread -------------------------------------------------------
@@ -466,38 +532,75 @@ class PanoramaStitcher:
             )
             self._canvas_mgr.place_first(thermal)
             self._prev = fp
-            self._H_acc = np.eye(3, dtype=np.float64)
-            fp.H_to_canvas = self._H_acc.copy()
+            self._H_to_global = np.eye(3, dtype=np.float64)
+            fp.H_to_global = self._H_to_global.copy()
             self._stitched.append(fp)
-            self._frames_stitched = 1
+            self.frames_stitched = 1
+            
+            # Add first frame as keyframe
+            self._add_keyframe(fp)
+            
             print("[PANORAMA] First frame placed on canvas.")
             return
 
         H, inliers = self._aligner.compute_homography(self._prev.rgb, fp.rgb)
 
+        # Normal tracking failed - try alternative previous frame
         if H is None and len(self._stitched) >= 2:
             alt_prev = self._stitched[-2]
             H, inliers = self._aligner.compute_homography(alt_prev.rgb, fp.rgb)
-            if H is not None and alt_prev.H_to_canvas is not None:
+            if H is not None and alt_prev.H_to_global is not None:
                 alt_tx = float(H[0, 2])
                 alt_ty = float(H[1, 2])
-                self._H_acc = alt_prev.H_to_canvas.copy()
-                self._H_acc[0, 2] -= alt_tx
-                self._H_acc[1, 2] -= alt_ty
+                self._H_to_global = alt_prev.H_to_global.copy()
+                self._H_to_global[0, 2] -= alt_tx
+                self._H_to_global[1, 2] -= alt_ty
                 fp.low_confidence = True
                 self._low_conf_count += 1
 
+        # Tracking still failed - try relocalization against keyframe database
         if H is None:
-            self._frames_skipped += 1
-            print(f"[PANORAMA] Frame {fp.seq_id} skipped (inliers={inliers}).")
-            return
+            relocalize_match = self._relocalize(fp)
+            
+            if relocalize_match is not None:
+                # Found matching keyframe! Compute global position from it
+                kf = self._keyframes[relocalize_match.kf_id]
+                # H_match maps keyframe → current, so apply it to keyframe's global position
+                fp.H_to_global = kf.H_to_global @ relocalize_match.H_match
+                self._H_to_global = fp.H_to_global.copy()
+                fp.inlier_count = relocalize_match.inliers
+                self._total_inliers += relocalize_match.inliers
+                self.relocalizations += 1
+                
+                print(f"[RELOCALIZE] Matched keyframe {kf.id} (inliers={relocalize_match.inliers})")
+                
+                # Warp thermal to global canvas
+                self._canvas_mgr.expand_if_needed()
+                ok = self._canvas_mgr.warp_and_blend(thermal, self._H_to_global)
+                if ok:
+                    self.frames_stitched += 1
+                    self._stitched.append(fp)
+                    self._prev = fp
+                    self._emit_update()
+                    
+                    # Add as keyframe if criteria met
+                    if self._should_add_keyframe(fp):
+                        self._add_keyframe(fp)
+                else:
+                    self.frames_skipped += 1
+                return
+            else:
+                # Truly lost - skip frame
+                self.frames_skipped += 1
+                print(f"[PANORAMA] Frame {fp.seq_id} skipped (tracking lost, relocalization failed)")
+                return
 
         tx = float(H[0, 2])
         ty = float(H[1, 2])
         move = math.sqrt(tx**2 + ty**2)
 
         if move > self._cfg.max_move_px:
-            self._frames_skipped += 1
+            self.frames_skipped += 1
             print(f"[PANORAMA] Frame {fp.seq_id} rejected: move={move:.1f}px > max={self._cfg.max_move_px}")
             return
 
@@ -505,54 +608,199 @@ class PanoramaStitcher:
             return
 
         if not fp.low_confidence:
-            self._H_acc[0, 2] += tx
-            self._H_acc[1, 2] += ty
+            self._H_to_global[0, 2] += tx
+            self._H_to_global[1, 2] += ty
 
-        fp.H_to_canvas = self._H_acc.copy()
+        fp.H_to_global = self._H_to_global.copy()
         fp.inlier_count = inliers
         self._total_inliers += inliers
 
         self._canvas_mgr.expand_if_needed()
-        ok = self._canvas_mgr.warp_and_blend(thermal, self._H_acc)
+        ok = self._canvas_mgr.warp_and_blend(thermal, self._H_to_global)
         if ok:
-            self._frames_stitched += 1
+            self.frames_stitched += 1
             self._stitched.append(fp)
             self._prev = fp
             self._emit_update()
-            if (self._frames_stitched % self._cfg.bundle_adjust_interval == 0
-                    and self._frames_stitched > self._cfg.bundle_adjust_interval):
+            
+            # Add as keyframe if criteria met
+            if self._should_add_keyframe(fp):
+                self._add_keyframe(fp)
+            
+            if (self.frames_stitched % self._cfg.bundle_adjust_interval == 0
+                    and self.frames_stitched > self._cfg.bundle_adjust_interval):
                 self._drift_correct()
         else:
-            self._frames_skipped += 1
+            self.frames_skipped += 1
 
     def _drift_correct(self) -> None:
-        """Simple drift correction: cross-match current frame with older frames."""
-        if len(self._stitched) < 10:
+        """Loop closure via keyframe database - correct drift when revisiting known areas."""
+        if len(self._keyframes) < 3:
             return
 
         curr = self._stitched[-1]
-        offsets = [5, 10, 15]
-        for off in offsets:
-            idx = len(self._stitched) - 1 - off
-            if idx < 0:
-                continue
-            old = self._stitched[idx]
-            H_cross, inliers = self._aligner.compute_homography(old.rgb, curr.rgb)
-            if H_cross is not None and inliers > 15:
-                # Compute expected H from chain
-                if old.H_to_canvas is not None and curr.H_to_canvas is not None:
-                    H_expected = curr.H_to_canvas @ np.linalg.inv(old.H_to_canvas)
+        if curr.H_to_global is None:
+            return
+        
+        # Try to match current frame with older keyframes (skip most recent ones)
+        for i in range(len(self._keyframes) - 3):  # Skip last 2 keyframes
+            kf = self._keyframes[i]
+            try:
+                H_cross, inliers = self._aligner.compute_homography(kf.rgb, curr.rgb)
+                if H_cross is not None and inliers > 20:  # Higher threshold for drift correction
+                    # Found loop closure!
+                    # H_expected: where we think curr is relative to kf (from chain)
+                    H_expected = curr.H_to_global @ np.linalg.inv(kf.H_to_global)
+                    # H_measured: where curr actually is relative to kf (from features)
                     H_measured = np.linalg.inv(H_cross)
-                    # Blend 50% correction
+                    
+                    # Compute correction
                     correction = (H_measured + H_expected) / 2.0
                     correction[2, :] = [0, 0, 1]  # keep projective row clean
+                    
                     # Apply correction to accumulated H
-                    self._H_acc = old.H_to_canvas @ correction
-                    self._drift_corrections += 1
+                    self._H_to_global = kf.H_to_global @ correction
+                    self.drift_corrections += 1
+                    
                     tx = abs(H_measured[0, 2] - H_expected[0, 2])
                     ty = abs(H_measured[1, 2] - H_expected[1, 2])
-                    print(f"[PANORAMA] Drift correction applied (Δx={tx:.1f}px, Δy={ty:.1f}px)")
-                break
+                    print(f"[LOOP_CLOSURE] Drift corrected via keyframe {kf.id} (Δx={tx:.1f}px, Δy={ty:.1f}px, inliers={inliers})")
+                    break
+            except Exception:
+                continue
+
+    # -- Relocalization methods (Phase 2) ---------------------------------------
+
+    def _relocalize(self, fp: FramePair) -> Optional[KeyframeMatch]:
+        """Attempt to relocalize current frame against keyframe database.
+        
+        Returns best matching keyframe if found, None otherwise.
+        """
+        if not self._keyframes:
+            return None
+        
+        # Extract features for current frame if not already done
+        if fp.features is None:
+            fp.features = self._aligner.extract_features(fp.rgb)
+        
+        kp_curr, des_curr = fp.features
+        if des_curr is None or len(kp_curr) < MIN_RELOCALIZE_MATCHES:
+            return None
+        
+        best_match = None
+        best_inliers = 0
+        
+        # Match against all keyframes
+        for kf in self._keyframes:
+            try:
+                matches = self._aligner._matcher.knnMatch(kf.descriptors, des_curr, k=2)
+                good = []
+                for pair in matches:
+                    if len(pair) == 2:
+                        m, n = pair
+                        if m.distance < 0.75 * n.distance:
+                            good.append(m)
+                
+                if len(good) < MIN_RELOCALIZE_MATCHES:
+                    continue
+                
+                # Compute homography from keyframe to current
+                src_pts = np.float32([kf.keypoints[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+                dst_pts = np.float32([kp_curr[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+                
+                M, mask = cv2.estimateAffinePartial2D(
+                    src_pts, dst_pts,
+                    method=cv2.RANSAC,
+                    ransacReprojThreshold=self._aligner._ransac_threshold,
+                )
+                
+                if M is not None and mask is not None:
+                    inliers = int(mask.sum())
+                    if inliers > best_inliers:
+                        # Convert affine to homography
+                        H = np.array([[M[0, 0], M[0, 1], M[0, 2]],
+                                      [M[1, 0], M[1, 1], M[1, 2]],
+                                      [0.0, 0.0, 1.0]], dtype=np.float64)
+                        best_inliers = inliers
+                        best_match = KeyframeMatch(kf.id, H, inliers)
+            
+            except Exception as e:
+                # Silently skip problematic keyframes
+                continue
+        
+        return best_match if best_inliers >= MIN_RELOCALIZE_INLIERS else None
+
+    def _should_add_keyframe(self, fp: FramePair) -> bool:
+        """Determine if current frame should be added as keyframe.
+        
+        Criteria:
+        - Distance from last keyframe > threshold
+        - Time since last keyframe > threshold
+        - First frame always added
+        """
+        if not self._keyframes:
+            return True
+        
+        # Distance check
+        if fp.H_to_global is not None:
+            curr_pos = np.array([fp.H_to_global[0, 2], fp.H_to_global[1, 2]])
+            dist = np.linalg.norm(curr_pos - self._last_keyframe_pos)
+            if dist > KEYFRAME_DISTANCE_THRESHOLD:
+                return True
+        
+        # Time check
+        if fp.timestamp - self._last_keyframe_time > KEYFRAME_TIME_THRESHOLD:
+            return True
+        
+        return False
+
+    def _add_keyframe(self, fp: FramePair) -> None:
+        """Add current frame as keyframe to database."""
+        if fp.H_to_global is None:
+            return
+        
+        # Extract features if not already done
+        if fp.features is None:
+            fp.features = self._aligner.extract_features(fp.rgb)
+        
+        kp, des = fp.features
+        if des is None or len(kp) == 0:
+            return
+        
+        # Compute canvas bounding box (approximate)
+        h, w = fp.thermal_gray.shape[:2]
+        x1 = int(fp.H_to_global[0, 2])
+        y1 = int(fp.H_to_global[1, 2])
+        x2 = x1 + w
+        y2 = y1 + h
+        
+        # Create keyframe
+        kf = Keyframe(
+            id=self._kf_id_counter,
+            seq_id=fp.seq_id,
+            timestamp=fp.timestamp,
+            rgb=fp.rgb.copy(),
+            thermal=fp.thermal_gray.copy(),
+            H_to_global=fp.H_to_global.copy(),
+            keypoints=kp,
+            descriptors=des.copy(),
+            canvas_bbox=(x1, y1, x2, y2),
+        )
+        
+        self._keyframes.append(kf)
+        self._kf_id_counter += 1
+        self._last_keyframe_pos = np.array([fp.H_to_global[0, 2], fp.H_to_global[1, 2]])
+        self._last_keyframe_time = fp.timestamp
+        
+        # Prune old keyframes if database too large
+        if len(self._keyframes) > MAX_KEYFRAMES:
+            # Remove oldest keyframes (keep first and recent ones)
+            mid_start = 1
+            mid_end = len(self._keyframes) - (MAX_KEYFRAMES // 2)
+            if mid_end > mid_start:
+                del self._keyframes[mid_start:mid_end]
+        
+        print(f"[PANORAMA] Added keyframe {kf.id} (total: {len(self._keyframes)})")
 
     def _emit_update(self) -> None:
         """Emit a PANORAMA_UPDATE event via the callback."""
@@ -569,7 +817,7 @@ class PanoramaStitcher:
                 event_type="PANORAMA_UPDATE",
                 confidence=1.0,
                 metadata={
-                    "frames_stitched": self._frames_stitched,
+                    "frames_stitched": self.frames_stitched,
                     "canvas_w": cw,
                     "canvas_h": ch,
                 },

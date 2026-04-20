@@ -53,9 +53,9 @@ class PanoramaConfig:
     capture_fps: float = 5.0      # how many frames/sec to stitch
 
     # Stitching
-    akaze_threshold: float = 0.001
+    akaze_threshold: float = 0.0001  # Not used (ORB detector now)
     ransac_threshold: float = 5.0
-    min_inliers: int = 10
+    min_inliers: int = 3  # ORB detector optimized for thermal (was 4)
     canvas_padding_factor: int = 5
     blend_width: int = 32
     bundle_adjust_interval: int = 20
@@ -100,32 +100,52 @@ class FramePair:
 class FeatureAligner:
     """Translation-only feature aligner.
 
-    Extracts only (tx, ty) from AKAZE matches, discards rotation and scale.
+    Extracts only (tx, ty) from feature matches, discards rotation and scale.
     This prevents drift accumulation — correct for a robot that only
     translates on a flat wall surface.
+    
+    Uses ORB detector for thermal images (better than AKAZE for low-res thermal).
     """
 
-    def __init__(self, akaze_threshold: float = 0.001,
-                 ransac_threshold: float = 5.0, min_inliers: int = 6) -> None:
-        self._akaze = cv2.AKAZE_create(threshold=akaze_threshold)
-        self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    def __init__(self, akaze_threshold: float = 0.0001,
+                 ransac_threshold: float = 5.0, min_inliers: int = 3) -> None:
+        # ORB detector - much better for thermal low-res images
+        self._detector = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8)
+        self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         self._ransac_threshold = ransac_threshold
         self._min_inliers = min_inliers
+        # CLAHE for thermal contrast enhancement - BOOSTED for thermal
+        self._clahe = cv2.createCLAHE(clipLimit=8.0, tileGridSize=(8, 8))
 
     def compute_homography(self, rgb_prev: np.ndarray,
                            rgb_curr: np.ndarray) -> tuple[Optional[np.ndarray], int]:
         """Returns a 3×3 pure-translation matrix or None."""
         g1 = cv2.cvtColor(rgb_prev, cv2.COLOR_BGR2GRAY)
         g2 = cv2.cvtColor(rgb_curr, cv2.COLOR_BGR2GRAY)
-        kp1, des1 = self._akaze.detectAndCompute(g1, None)
-        kp2, des2 = self._akaze.detectAndCompute(g2, None)
+        
+        # Enhance contrast for low-res thermal (FLIR Lepton 160x120)
+        if g1.shape[0] <= 120 or g1.shape[1] <= 160:
+            g1 = self._clahe.apply(g1)
+            g2 = self._clahe.apply(g2)
+        
+        # Gaussian blur for noise reduction before feature detection
+        g1 = cv2.GaussianBlur(g1, (3, 3), 0)
+        g2 = cv2.GaussianBlur(g2, (3, 3), 0)
+        
+        kp1, des1 = self._detector.detectAndCompute(g1, None)
+        kp2, des2 = self._detector.detectAndCompute(g2, None)
 
         if des1 is None or des2 is None or len(kp1) < 3 or len(kp2) < 3:
+            print(f"[FEATURE] SKIP: kp1={len(kp1) if kp1 else 0}, kp2={len(kp2) if kp2 else 0}, des1={des1 is not None}, des2={des2 is not None}")
             return None, 0
 
         raw = self._matcher.knnMatch(des1, des2, k=2)
         good = [m for pair in raw if len(pair) == 2
-                for m, n in [pair] if m.distance < 0.75 * n.distance]
+                for m, n in [pair] if m.distance < 0.8 * n.distance]  # Relaxed for thermal
+        
+        if len(good) < self._min_inliers:
+            print(f"[FEATURE] SKIP: matches={len(good)} < min_inliers={self._min_inliers}")
+            return None, 0
 
         if len(good) < 3:
             return None, len(good)
@@ -481,6 +501,7 @@ class PanoramaStitcher:
 
         if H is None:
             self.frames_skipped += 1
+            print(f"[STITCH] Frame {fp.seq_id} SKIPPED: no homography (total skip={self.frames_skipped})")
             return
 
         # Extract movement info from H (frame-space)
@@ -492,7 +513,7 @@ class PanoramaStitcher:
         # Reject bad matches
         if move > self._cfg.max_move_px:
             self.frames_skipped += 1
-            print(f"[PANORAMA] Frame {fp.seq_id} rejected: move={move:.1f}px > max={self._cfg.max_move_px}")
+            print(f"[STITCH] Frame {fp.seq_id} REJECTED: move={move:.1f}px > max={self._cfg.max_move_px}")
             return
 
         # Silent skip if robot hasn't moved enough
@@ -516,6 +537,7 @@ class PanoramaStitcher:
             self.frames_stitched += 1
             self._stitched.append(fp)
             self._prev = fp
+            print(f"[STITCH] Frame {fp.seq_id} SUCCESS: inliers={inliers}, move={move:.1f}px (total stitched={self.frames_stitched})")
             self._notify_update()
             if (self.frames_stitched % self._cfg.bundle_adjust_interval == 0
                     and self.frames_stitched > self._cfg.bundle_adjust_interval):

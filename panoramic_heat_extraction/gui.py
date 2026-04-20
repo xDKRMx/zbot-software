@@ -16,11 +16,101 @@ import argparse
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+import tkinter as tk
+from tkinter import ttk, messagebox
+from PIL import Image, ImageTk
+
+from stitcher import PanoramaConfig, PanoramaStitcher
+
+# Try to import Pure Thermal bridge (for FLIR Lepton 2.5)
+try:
+    from purethermal_python import PureThermalCamera
+    PURETHERMAL_AVAILABLE = True
+except (ImportError, FileNotFoundError) as e:
+    PURETHERMAL_AVAILABLE = False
+    print(f"[INFO] Pure Thermal bridge not available: {e}")
+
+# Import Lepton thermal processor (for fixed-scale normalization)
+try:
+    import sys as _sys
+    from pathlib import Path as _Path
+    _zbot_path = _Path(__file__).resolve().parent.parent / "zbot-eyes" / "src"
+    if _zbot_path.exists() and str(_zbot_path) not in _sys.path:
+        _sys.path.insert(0, str(_zbot_path))
+    from net_inspector.lepton_processor import LeptonThermalProcessor
+    LEPTON_PROCESSOR_AVAILABLE = True
+except ImportError as e:
+    LEPTON_PROCESSOR_AVAILABLE = False
+    LeptonThermalProcessor = None
+    print(f"[INFO] Lepton processor not available: {e}")
+
+
+def discover_pure_thermal_camera() -> Optional[Tuple[int, int, str]]:
+    """Scan all camera indices to find Pure Thermal board.
+    
+    Returns:
+        (index, backend, backend_name) if found, None otherwise
+    """
+    print("\n[AUTO-DISCOVER] Quick scan for Pure Thermal camera (timeout: 10s)...")
+    
+    import time as _time
+    start_time = _time.time()
+    
+    backends_to_try = []
+    if sys.platform == "win32":
+        # Only try MSMF - DSHOW is too slow
+        backends_to_try = [(cv2.CAP_MSMF, "CAP_MSMF")]
+    else:
+        backends_to_try = [(cv2.CAP_V4L2, "CAP_V4L2")]
+    
+    # Scan only likely indices (0-3) to save time
+    for idx in range(4):
+        if (_time.time() - start_time) > 10.0:
+            print("[AUTO-DISCOVER] ⏱️ Timeout reached (10s)")
+            break
+            
+        for backend, backend_name in backends_to_try:
+            try:
+                cap = cv2.VideoCapture(idx, backend)
+                if not cap.isOpened():
+                    cap.release()
+                    continue
+                
+                # Configure for Y16
+                cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 160)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 120)
+                
+                # Test read with timeout
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    # Check if it's Pure Thermal signature
+                    is_thermal = (
+                        frame.dtype == np.uint16 and 
+                        (frame.shape == (120, 160) or frame.shape == (60, 80))
+                    ) or (
+                        len(frame.shape) == 2 and
+                        (frame.shape == (120, 160) or frame.shape == (60, 80))
+                    )
+                    
+                    if is_thermal:
+                        print(f"[AUTO-DISCOVER] FOUND Pure Thermal: index={idx}, backend={backend_name}")
+                        print(f"[AUTO-DISCOVER] Shape: {frame.shape}, dtype: {frame.dtype}")
+                        cap.release()
+                        return (idx, backend, backend_name)
+                
+                cap.release()
+            except Exception:
+                pass
+    
+    print("[AUTO-DISCOVER] Pure Thermal not found (OpenCV cannot access it)")
+    return None
 
 try:
     import tkinter as tk
@@ -54,7 +144,19 @@ class PanoramaGUI:
         self._stop_evt = threading.Event()
 
         self._latest_rgb: Optional[np.ndarray] = None
+        self._latest_thermal_viz: Optional[np.ndarray] = None
         self._latest_heatmap: Optional[np.ndarray] = None
+        
+        # Lepton thermal processor (fixed-scale normalization)
+        if LEPTON_PROCESSOR_AVAILABLE:
+            self._lepton_processor = LeptonThermalProcessor(
+                min_raw=28815,  # ~15°C
+                max_raw=33315,  # ~60°C
+                colormap=cv2.COLORMAP_JET,
+                apply_histogram_eq=False,
+            )
+        else:
+            self._lepton_processor = None
         self._frame_lock = threading.Lock()
         self._last_cap_ts = 0.0
 
@@ -101,7 +203,9 @@ class PanoramaGUI:
                  fg="#a6adc8", font=("Helvetica", 9)).pack(side="left", padx=10)
 
         self._source_var = tk.StringVar(value="rgb")
-        has_thermal = self._cfg.thermal_camera_idx >= 0
+        # Thermal available if explicit index OR if thermal source requested
+        has_thermal = (self._cfg.thermal_camera_idx >= 0 or 
+                      self._cfg.use_thermal_as_source)
 
         for val, txt in [("rgb", "RGB camera"), ("thermal", "Thermal / IR camera")]:
             rb = tk.Radiobutton(
@@ -183,40 +287,107 @@ class PanoramaGUI:
 
     def _start(self) -> None:
         # Runs in background thread — NO direct Tkinter calls here
-        idx = self._cfg.rgb_camera_idx
+        
+        # Open RGB camera only if NOT using thermal as source
+        if not self._cfg.use_thermal_as_source:
+            idx = self._cfg.rgb_camera_idx
 
-        # Windows uses index directly, Linux uses /dev/videoX path
-        if sys.platform == "win32":
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        else:
-            cap = cv2.VideoCapture(f"/dev/video{idx}")
-
-        if not cap.isOpened():
-            self._root.after(0, lambda: messagebox.showerror(
-                "Camera Error", f"Cannot open camera {idx}"))
-            self._root.after(0, lambda: self._btn_start.config(
-                state="normal", text="▶ Start", bg="#a6e3a1"))
-            self._root.after(0, lambda: self._status_var.set("Ready"))
-            return
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self._cfg.width))
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._cfg.height))
-        self._cap_rgb = cap
-
-        # Open thermal camera
-        self._cap_thermal = None
-        tidx = self._cfg.thermal_camera_idx
-        if tidx >= 0:
+            # Windows uses index directly, Linux uses /dev/videoX path
             if sys.platform == "win32":
-                tcap = cv2.VideoCapture(tidx, cv2.CAP_DSHOW)
+                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
             else:
-                tcap = cv2.VideoCapture(f"/dev/video{tidx}")
-            if tcap.isOpened():
-                tcap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self._cfg.width))
-                tcap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._cfg.height))
-                self._cap_thermal = tcap
+                cap = cv2.VideoCapture(f"/dev/video{idx}")
+
+            if not cap.isOpened():
+                self._root.after(0, lambda: messagebox.showerror(
+                    "Camera Error", f"Cannot open camera {idx}"))
+                self._root.after(0, lambda: self._btn_start.config(
+                    state="normal", text="▶ Start", bg="#a6e3a1"))
+                self._root.after(0, lambda: self._status_var.set("Ready"))
+                return
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self._cfg.width))
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._cfg.height))
+            self._cap_rgb = cap
+        else:
+            # Thermal-only mode - no RGB camera needed
+            self._cap_rgb = None
+            print("[INFO] Thermal-only mode - skipping RGB camera")
+
+        # Open thermal camera (FLIR Lepton via Pure Thermal board)
+        self._cap_thermal = None
+        self._thermal_is_purethermal = False
+        tidx = self._cfg.thermal_camera_idx
+        
+        # If thermal source selected, try to open thermal camera even without explicit index
+        if tidx >= 0 or self._cfg.use_thermal_as_source:
+            print(f"\n[THERMAL] Initializing FLIR Lepton 2.5 Pure Thermal...")
+            
+            # METHOD 1: Try Pure Thermal bridge DLL (Windows Media Foundation)
+            if PURETHERMAL_AVAILABLE:
+                print("[THERMAL] Attempting native Pure Thermal bridge...")
+                try:
+                    pt_cam = PureThermalCamera()
+                    if pt_cam.is_connected():
+                        self._cap_thermal = pt_cam
+                        self._thermal_is_purethermal = True
+                        print(f"[THERMAL] SUCCESS - Pure Thermal connected via bridge DLL")
+                        print(f"[THERMAL] Resolution: {pt_cam.width}x{pt_cam.height} (FLIR Lepton 2.5)")
+                        
+                        # Perform FFC (Flat Field Correction) on startup
+                        print(f"[THERMAL] Performing camera warmup and calibration...")
+                        try:
+                            if pt_cam.perform_ffc():
+                                print(f"[THERMAL] Calibration complete\n")
+                            else:
+                                print(f"[THERMAL] WARNING: FFC not available (using older DLL)\n")
+                        except Exception as ffc_err:
+                            print(f"[THERMAL] WARNING: FFC failed: {ffc_err}\n")
+                    else:
+                        print(f"[THERMAL] WARNING: Bridge loaded but device not connected")
+                except Exception as e:
+                    print(f"[THERMAL] Bridge failed: {e}")
             else:
-                self._root.after(0, lambda: messagebox.showwarning(
-                    "Thermal Camera", f"Cannot open thermal {tidx}. Using RGB."))
+                print("[THERMAL] WARNING: Pure Thermal bridge DLL not available")
+                print("[THERMAL] Please build PureThermalBridge.dll (see BUILD_PURETHERMAL.md)")
+            
+            # METHOD 2: Fallback to OpenCV (usually doesn't work for Pure Thermal)
+            if self._cap_thermal is None:
+                print("[THERMAL] Attempting OpenCV fallback (rarely works for Pure Thermal)...")
+                discovery = discover_pure_thermal_camera()
+                
+                if discovery is not None:
+                    found_idx, found_backend, backend_name = discovery
+                    try:
+                        tcap = cv2.VideoCapture(found_idx, found_backend)
+                        if tcap.isOpened():
+                            tcap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+                            tcap.set(cv2.CAP_PROP_FRAME_WIDTH, 160)
+                            tcap.set(cv2.CAP_PROP_FRAME_HEIGHT, 120)
+                            ret_test, frame_test = tcap.read()
+                            if ret_test and frame_test is not None:
+                                self._cap_thermal = tcap
+                                self._thermal_is_purethermal = False
+                                print(f"[THERMAL] OpenCV fallback success: {frame_test.shape}\n")
+                            else:
+                                tcap.release()
+                    except Exception as e:
+                        print(f"[THERMAL] OpenCV failed: {e}")
+            
+            # Final status
+            if self._cap_thermal is None:
+                print(f"[THERMAL] FAILED - Could not initialize Pure Thermal")
+                print(f"[THERMAL] For exhibition: Build PureThermalBridge.dll (run purethermal_bridge\\build.bat)")
+                self._root.after(0, lambda: messagebox.showerror(
+                    "Pure Thermal REQUIRED", 
+                    f"FLIR Lepton 2.5 not accessible!\n\n"
+                    f"For exhibition, you MUST build PureThermalBridge.dll\n\n"
+                    f"Steps:\n"
+                    f"1. Open: purethermal_bridge\\build.bat\n"
+                    f"2. Requires: Visual Studio with C++ tools\n"
+                    f"3. See: BUILD_PURETHERMAL.md\n\n"
+                    f"Falling back to RGB (not suitable for exhibition)."))
+            else:
+                print(f"[THERMAL] Ready for thermal capture\n")
 
         # Create stitcher
         self._stitcher = PanoramaStitcher(self._cfg, on_update=self._on_stitch_update)
@@ -225,6 +396,7 @@ class PanoramaGUI:
         self._running = True
         self._stop_evt.clear()
         self._last_cap_ts = 0.0
+        self._seq = 0  # Frame sequence counter for debug logging
 
         self._cam_thread = threading.Thread(target=self._camera_loop, daemon=True)
         self._cam_thread.start()
@@ -249,7 +421,9 @@ class PanoramaGUI:
                 self._cap_rgb.release()
                 self._cap_rgb = None
             if self._cap_thermal:
-                self._cap_thermal.release()
+                # Release thermal camera (works for both OpenCV and PureThermalCamera)
+                if hasattr(self._cap_thermal, 'release'):
+                    self._cap_thermal.release()
                 self._cap_thermal = None
             if self._stitcher:
                 self._stitcher.stop()
@@ -282,19 +456,71 @@ class PanoramaGUI:
                        and self._cap_thermal is not None)
 
         while self._running and not self._stop_evt.is_set():
-            ret, frame_rgb = self._cap_rgb.read()
-            if not ret or frame_rgb is None:
-                time.sleep(0.05)
-                continue
+            # Read RGB frame only if RGB camera is available
+            frame_rgb = None
+            if self._cap_rgb is not None:
+                ret, frame_rgb = self._cap_rgb.read()
+                if not ret or frame_rgb is None:
+                    time.sleep(0.05)
+                    continue
 
             frame_thermal = None
+            frame_thermal_display = None  # For live camera visualization
             if self._cap_thermal is not None:
-                ret_t, frame_thermal = self._cap_thermal.read()
-                if not ret_t:
+                # Both PureThermalCamera and cv2.VideoCapture use .read() -> (bool, ndarray)
+                ret_t, frame_thermal_raw = self._cap_thermal.read()
+                if ret_t and frame_thermal_raw is not None:
+                    # Process with Lepton fixed-scale normalization
+                    if frame_thermal_raw.dtype == np.uint16:
+                        # Use Lepton processor if available, otherwise fallback to adaptive
+                        if self._lepton_processor is not None:
+                            # Fixed-scale normalization (15-60°C range)
+                            thermal_8bit, thermal_color = self._lepton_processor.process_frame(
+                                frame_thermal_raw,
+                                return_colorized=True
+                            )
+                            
+                            # Debug: print temperature stats every 30 frames
+                            if self._seq % 30 == 0:
+                                stats = self._lepton_processor.get_temperature_stats(frame_thermal_raw)
+                                print(f"[THERMAL] {stats['celsius_min']:.1f}°C - {stats['celsius_max']:.1f}°C "
+                                      f"(raw: {stats['raw_min']}-{stats['raw_max']})")
+                            
+                            # For display: use colorized JET version
+                            frame_thermal_display = thermal_color
+                        else:
+                            # Fallback: adaptive normalization (old method)
+                            thermal_min = frame_thermal_raw.min()
+                            thermal_max = frame_thermal_raw.max()
+                            
+                            if self._seq % 30 == 0:
+                                print(f"[THERMAL DATA] min={thermal_min}, max={thermal_max}, range={thermal_max-thermal_min}")
+                            
+                            if thermal_max > thermal_min:
+                                thermal_8bit = ((frame_thermal_raw - thermal_min) * (255.0 / (thermal_max - thermal_min))).astype(np.uint8)
+                            else:
+                                thermal_8bit = np.zeros_like(frame_thermal_raw, dtype=np.uint8)
+                            
+                            thermal_8bit = cv2.equalizeHist(thermal_8bit)
+                            frame_thermal_display = cv2.applyColorMap(thermal_8bit, cv2.COLORMAP_JET)
+                        
+                        # For stitching: use grayscale BGR
+                        frame_thermal = cv2.cvtColor(thermal_8bit, cv2.COLOR_GRAY2BGR)
+                    else:
+                        # Already 8-bit (shouldn't happen with Y16, but handle gracefully)
+                        if len(frame_thermal_raw.shape) == 2:
+                            frame_thermal = cv2.cvtColor(frame_thermal_raw, cv2.COLOR_GRAY2BGR)
+                        else:
+                            frame_thermal = frame_thermal_raw
+                else:
                     frame_thermal = None
 
             with self._frame_lock:
-                self._latest_rgb = frame_rgb.copy()
+                self._latest_rgb = frame_rgb.copy() if frame_rgb is not None else None
+                if frame_thermal_display is not None:
+                    self._latest_thermal_viz = frame_thermal_display.copy()
+            
+            self._seq += 1  # Increment frame counter
 
             # Feed stitcher at capture_fps rate
             now = time.time()
@@ -303,8 +529,10 @@ class PanoramaGUI:
                 heat_src = (frame_thermal
                             if use_thermal and frame_thermal is not None
                             else frame_rgb)
-                thermal_gray = cv2.cvtColor(heat_src, cv2.COLOR_BGR2GRAY)
-                self._stitcher.feed_frame(frame_rgb.copy(), thermal_gray, now)
+                if heat_src is not None:
+                    thermal_gray = cv2.cvtColor(heat_src, cv2.COLOR_BGR2GRAY)
+                    rgb_for_stitcher = frame_rgb.copy() if frame_rgb is not None else heat_src.copy()
+                    self._stitcher.feed_frame(rgb_for_stitcher, thermal_gray, now)
 
             time.sleep(0.01)
 
@@ -322,9 +550,14 @@ class PanoramaGUI:
 
         with self._frame_lock:
             rgb = self._latest_rgb.copy() if self._latest_rgb is not None else None
+            thermal_viz = self._latest_thermal_viz.copy() if hasattr(self, '_latest_thermal_viz') and self._latest_thermal_viz is not None else None
             hm = self._latest_heatmap.copy() if self._latest_heatmap is not None else None
 
-        if rgb is not None:
+        # Show thermal visualization if thermal mode, otherwise RGB
+        use_thermal = self._source_var.get() == "thermal"
+        if use_thermal and thermal_viz is not None:
+            self._put_image(self._cam_label, thermal_viz)
+        elif rgb is not None:
             self._put_image(self._cam_label, rgb)
 
         if hm is not None:
@@ -345,16 +578,28 @@ class PanoramaGUI:
     def _put_image(self, label: tk.Label, img_bgr: np.ndarray) -> None:
         """Scale img_bgr to fit inside PANEL_W × PANEL_H, then display."""
         h, w = img_bgr.shape[:2]
-        scale = min(PANEL_W / max(w, 1), PANEL_H / max(h, 1))
-        nw, nh = int(w * scale), int(h * scale)
-        resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+        
+        # For small thermal frames (160x120), FILL entire panel (no letterbox)
+        if w < 200:  # Thermal camera resolution
+            # Stretch to fill entire panel for maximum visibility
+            resized = cv2.resize(img_bgr, (PANEL_W, PANEL_H), 
+                                interpolation=cv2.INTER_LINEAR)  # Smooth upscale for thermal
+        else:
+            # For larger images, maintain aspect ratio with letterbox
+            scale = min(PANEL_W / max(w, 1), PANEL_H / max(h, 1))
+            nw, nh = int(w * scale), int(h * scale)
+            resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
 
-        # Letterbox onto black background
-        canvas = np.zeros((PANEL_H, PANEL_W, 3), dtype=np.uint8)
-        canvas[:] = (17, 17, 27)
-        y0 = (PANEL_H - nh) // 2
-        x0 = (PANEL_W - nw) // 2
-        canvas[y0:y0+nh, x0:x0+nw] = resized
+        # Letterbox only for non-thermal (RGB) images
+        if w >= 200:
+            canvas = np.zeros((PANEL_H, PANEL_W, 3), dtype=np.uint8)
+            canvas[:] = (17, 17, 27)
+            y0 = (PANEL_H - nh) // 2
+            x0 = (PANEL_W - nw) // 2
+            canvas[y0:y0+nh, x0:x0+nw] = resized
+        else:
+            # Thermal: already full panel size
+            canvas = resized
 
         img_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
         pil = Image.fromarray(img_rgb)
