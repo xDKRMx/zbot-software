@@ -174,7 +174,7 @@ class PanoramaConfig:
     overlap_margin_px: int = 20        # extra pixels beyond edge mask for vibration
     rotation_threshold_deg: float = 5.0  # above this → fallback to unvisited-only
     max_move_px: float = 400.0         # above this → reject frame (bad match/shake)
-    min_move_px: float = 5.0           # below this → skip (robot not moving enough)
+    min_move_px: float = 2.0           # below this → skip (was 5.0 - lowered for video)
 
     # Output
     output_dir: Path = OUTPUT_DIR
@@ -306,12 +306,12 @@ class FeatureAligner:
         criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 1e-3)
         
         try:
+            # OpenCV 4.13+ removed gaussFiltSize parameter
             cc, warp_matrix = cv2.findTransformECC(
                 gray1, gray2,
                 warp_matrix,
                 cv2.MOTION_EUCLIDEAN,
-                criteria,
-                gaussFiltSize=5
+                criteria
             )
             
             if cc < 0.5:  # Low correlation
