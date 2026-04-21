@@ -50,7 +50,7 @@ try:
 
     import tkinter as tk
 
-    from tkinter import messagebox
+    from tkinter import messagebox, filedialog
 
     from PIL import Image, ImageTk
 
@@ -105,6 +105,10 @@ class PanoramaGUI:
         self._cam_thread: Optional[threading.Thread] = None
 
         self._stop_evt = threading.Event()
+
+        self._video_file: Optional[str] = None  # Video import path
+
+        self._is_video_mode = False  # True if processing video file
 
 
 
@@ -185,6 +189,20 @@ class PanoramaGUI:
             command=self._reset_panorama)
 
         self._btn_reset.pack(side="right", padx=4)
+
+
+
+        # Video import button
+
+        self._btn_import = tk.Button(
+
+            top, text="📁 Import Video", width=12,
+
+            bg="#fab387", fg="#1e1e2e", font=("Helvetica", 9, "bold"),
+
+            relief="flat", cursor="hand2", command=self._import_video)
+
+        self._btn_import.pack(side="right", padx=4)
 
 
 
@@ -364,6 +382,92 @@ class PanoramaGUI:
 
 
 
+    def _import_video(self) -> None:
+
+        """Import video file for processing (MP4/AVI/MOV)."""
+
+        if self._running:
+
+            messagebox.showwarning("Stop First", "Please stop current capture before importing video.")
+
+            return
+
+
+
+        filetypes = [
+
+            ("Video Files", "*.mp4 *.avi *.mov *.mkv *.wmv"),
+
+            ("MP4 Videos", "*.mp4"),
+
+            ("AVI Videos", "*.avi"),
+
+            ("All Files", "*.*")
+
+        ]
+
+
+
+        filepath = filedialog.askopenfilename(
+
+            title="Select Video File",
+
+            filetypes=filetypes
+
+        )
+
+
+
+        if not filepath:
+
+            return
+
+
+
+        # Test if video can be opened
+
+        test_cap = cv2.VideoCapture(filepath)
+
+        if not test_cap.isOpened():
+
+            messagebox.showerror("Video Error", f"Cannot open video file:\n{filepath}")
+
+            return
+
+
+
+        # Get video info
+
+        total_frames = int(test_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        fps = test_cap.get(cv2.CAP_PROP_FPS)
+
+        test_cap.release()
+
+
+
+        # Confirm
+
+        msg = f"Video loaded:\n{Path(filepath).name}\n\nFrames: {total_frames}\nFPS: {fps:.1f}\n\nProcess this video?"
+
+        if not messagebox.askyesno("Import Video", msg):
+
+            return
+
+
+
+        self._video_file = filepath
+
+        self._is_video_mode = True
+
+        self._status_var.set(f"Video loaded: {Path(filepath).name} ({total_frames} frames)")
+
+        self._btn_import.config(bg="#a6e3a1")  # Green = loaded
+
+        print(f"[VIDEO] Loaded: {filepath}")
+
+
+
     def _start(self) -> None:
 
         # Runs in background thread — NO direct Tkinter calls here
@@ -454,7 +558,13 @@ class PanoramaGUI:
 
 
 
-        self._cam_thread = threading.Thread(target=self._camera_loop, daemon=True)
+        if self._is_video_mode:
+
+            self._cam_thread = threading.Thread(target=self._video_loop, daemon=True)
+
+        else:
+
+            self._cam_thread = threading.Thread(target=self._camera_loop, daemon=True)
 
         self._cam_thread.start()
 
@@ -516,9 +626,13 @@ class PanoramaGUI:
 
             self._root.after(0, lambda: self._btn_reset.config(state="normal"))
 
-            self._root.after(0, lambda: self._status_var.set(
+            status_msg = "Stopped — press Export to save"
 
-                "Stopped — press Export to save"))
+            if self._is_video_mode:
+
+                status_msg = "Video processing complete — press Export to save"
+
+            self._root.after(0, lambda: self._status_var.set(status_msg))
 
         threading.Thread(target=_cleanup, daemon=True).start()
 
@@ -531,6 +645,12 @@ class PanoramaGUI:
             return
 
         self._stitcher = None
+
+        self._video_file = None
+
+        self._is_video_mode = False
+
+        self._btn_import.config(bg="#fab387")  # Orange = no video
 
         with self._frame_lock:
 
@@ -615,6 +735,154 @@ class PanoramaGUI:
 
 
             time.sleep(0.01)
+
+
+
+    def _video_loop(self) -> None:
+
+        """Process video file frame-by-frame."""
+
+        if not self._video_file:
+
+            print("[VIDEO] No video file loaded!")
+
+            self._running = False
+
+            return
+
+
+
+        cap = cv2.VideoCapture(self._video_file)
+
+        if not cap.isOpened():
+
+            print(f"[VIDEO] Cannot open: {self._video_file}")
+
+            self._running = False
+
+            return
+
+
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+
+        min_interval = 1.0 / self._cfg.capture_fps if self._cfg.capture_fps > 0 else 0.2
+
+
+
+        print(f"[VIDEO] Processing {total_frames} frames @ {fps:.1f} fps (capture rate: {self._cfg.capture_fps} fps)")
+
+
+
+        frame_idx = 0
+
+        processed = 0
+
+        use_thermal = self._source_var.get() == "thermal"
+
+
+
+        try:
+
+            while self._running and cap.isOpened():
+
+                ret, frame_rgb = cap.read()
+
+                if not ret:
+
+                    print("[VIDEO] End of video")
+
+                    break
+
+
+
+                frame_idx += 1
+
+
+
+                # Respect capture_fps
+
+                now = time.time()
+
+                if now - self._last_cap_ts < min_interval:
+
+                    continue
+
+                self._last_cap_ts = now
+
+
+
+                # Resize if needed
+
+                h, w = frame_rgb.shape[:2]
+
+                if w != self._cfg.width or h != self._cfg.height:
+
+                    frame_rgb = cv2.resize(frame_rgb, (self._cfg.width, self._cfg.height))
+
+
+
+                # Generate thermal from RGB (or use actual thermal if available)
+
+                heat_src = frame_rgb
+
+                if use_thermal and self._cap_thermal:
+
+                    ret_t, frame_thermal = self._cap_thermal.read()
+
+                    if ret_t:
+
+                        heat_src = frame_thermal
+
+
+
+                thermal_gray = cv2.cvtColor(heat_src, cv2.COLOR_BGR2GRAY)
+
+
+
+                # Feed to stitcher
+
+                self._stitcher.feed_frame(frame_rgb.copy(), thermal_gray, now)
+
+                processed += 1
+
+
+
+                # Update display
+
+                with self._frame_lock:
+
+                    self._latest_rgb = frame_rgb.copy()
+
+
+
+                # Progress update
+
+                if frame_idx % 10 == 0:
+
+                    progress = (frame_idx / total_frames) * 100 if total_frames > 0 else 0
+
+                    self._root.after(0, lambda p=progress, pr=processed:
+
+                        self._status_var.set(f"Processing video: {p:.1f}% ({pr} frames stitched)"))
+
+
+
+            print(f"[VIDEO] Processing complete: {processed} frames stitched")
+
+
+
+        except Exception as e:
+
+            print(f"[VIDEO] Error: {e}")
+
+        finally:
+
+            cap.release()
+
+            self._running = False
 
 
 

@@ -155,6 +155,7 @@ class PanoramaConfig:
     min_inliers: int = 3  # ORB detector optimized for thermal (was 4)
     use_ecc_fallback: bool = True  # z-bot-map ECC refinement
     blend_mode: str = "best"  # best, soft, or simple (z-bot-map integration)
+    temporal_smoothing: float = 0.5  # Anti-Picasso: 0.0=instant switch, 0.5=heavy smooth
     min_sharpness: float = 10.0  # Motion blur threshold (skip blurry frames)
     motion_quality_threshold: float = 0.0  # Skip frames below this quality
     canvas_padding_factor: int = 5
@@ -351,7 +352,8 @@ class CanvasManager:
     def __init__(self, frame_h: int, frame_w: int, padding_factor: int = 3,
                  overlap_margin_px: int = 20,
                  rotation_threshold_deg: float = 5.0,
-                 blend_mode: str = "best") -> None:
+                 blend_mode: str = "best",
+                 temporal_smoothing: float = 0.3) -> None:
         ch, cw = frame_h * padding_factor, frame_w * padding_factor
         self._canvas = np.zeros((ch, cw), dtype=np.float32)
         self._visited = np.zeros((ch, cw), dtype=bool)   # True = written at least once
@@ -365,11 +367,12 @@ class CanvasManager:
         self._frame_h = frame_h
         self._frame_w = frame_w
         self._blend_mode = blend_mode
+        self._temporal_smoothing = temporal_smoothing  # Anti-Picasso smoothing
         
         # z-bot-map best blend tracking
         if blend_mode == "best":
             self._detail_score = np.zeros((ch, cw), dtype=np.float32)
-            print(f"[CANVAS] Using 'best' blend mode (z-bot-map)")
+            print(f"[CANVAS] Using 'best' blend mode with temporal smoothing={temporal_smoothing}")
         else:
             self._detail_score = None
 
@@ -463,7 +466,7 @@ class CanvasManager:
     def _blend_best(self, gray: np.ndarray, gray_bgr: Optional[np.ndarray],
                     H_c: np.ndarray, warped: np.ndarray, 
                     new_data: np.ndarray, frame_quality: float) -> None:
-        """z-bot-map best blend: pick best observation per pixel."""
+        """z-bot-map best blend with temporal smoothing (anti-Picasso)."""
         ch, cw = self._canvas.shape
         
         # Compute detail score for this frame
@@ -488,11 +491,47 @@ class CanvasManager:
             borderMode=cv2.BORDER_CONSTANT, borderValue=0
         )
         
-        # Update pixels where new frame has better detail
-        better_mask = new_data & (warped_score > self._detail_score)
-        if better_mask.any():
-            self._canvas[better_mask] = warped[better_mask]
-            self._detail_score[better_mask] = warped_score[better_mask]
+        # ANTI-PICASSO: Temporal smoothing for overlap regions
+        revisit = new_data & self._visited
+        if not revisit.any():
+            return
+        
+        # Compute score difference
+        score_diff = warped_score[revisit] - self._detail_score[revisit]
+        
+        # Strong improvement: use new value with slight smoothing
+        strong_better = score_diff > 0.15  # Significant improvement
+        if strong_better.any():
+            revisit_idx = np.where(revisit)
+            strong_idx = (revisit_idx[0][strong_better], revisit_idx[1][strong_better])
+            
+            # Temporal smoothing: blend with existing canvas
+            alpha = 1.0 - self._temporal_smoothing  # New frame weight
+            self._canvas[strong_idx] = (
+                alpha * warped[strong_idx] + 
+                self._temporal_smoothing * self._canvas[strong_idx]
+            )
+            self._detail_score[strong_idx] = warped_score[strong_idx]
+        
+        # Moderate improvement: weighted blend
+        moderate_better = (score_diff > 0.05) & (score_diff <= 0.15)
+        if moderate_better.any():
+            revisit_idx = np.where(revisit)
+            mod_idx = (revisit_idx[0][moderate_better], revisit_idx[1][moderate_better])
+            
+            # Stronger smoothing for moderate changes
+            alpha = 0.5  # 50/50 blend
+            self._canvas[mod_idx] = (
+                alpha * warped[mod_idx] + 
+                (1.0 - alpha) * self._canvas[mod_idx]
+            )
+            self._detail_score[mod_idx] = (
+                alpha * warped_score[mod_idx] +
+                (1.0 - alpha) * self._detail_score[mod_idx]
+            )
+        
+        # Small difference: keep existing (prevent flicker)
+        # score_diff <= 0.05: no change
 
     def expand_if_needed(self, margin: int = 50) -> None:
         """Expand canvas if content is within margin pixels of any edge."""
@@ -689,6 +728,7 @@ class PanoramaStitcher:
                 overlap_margin_px=self._cfg.overlap_margin_px,
                 rotation_threshold_deg=self._cfg.rotation_threshold_deg,
                 blend_mode=self._cfg.blend_mode,  # z-bot-map integration
+                temporal_smoothing=self._cfg.temporal_smoothing,  # Anti-Picasso
             )
             self._canvas_mgr.place_first(thermal)
             fp.H_to_canvas = np.eye(3, dtype=np.float64)
