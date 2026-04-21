@@ -303,7 +303,8 @@ class FeatureAligner:
         When descriptor matching fails (low texture), use ECC alignment.
         """
         warp_matrix = np.eye(2, 3, dtype=np.float32)
-        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 1e-3)
+        # Relaxed criteria for thermal video: more iterations, higher epsilon
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-2)
         
         try:
             # OpenCV 4.13+ removed gaussFiltSize parameter
@@ -314,7 +315,7 @@ class FeatureAligner:
                 criteria
             )
             
-            if cc < 0.5:  # Low correlation
+            if cc < 0.3:  # Lowered threshold for thermal (was 0.5)
                 print(f"[ECC] SKIP: correlation={cc:.3f} too low")
                 return None, 0
             
@@ -331,7 +332,11 @@ class FeatureAligner:
             return H, 0  # inliers unknown for ECC
             
         except cv2.error as e:
-            print(f"[ECC] FAIL: {e}")
+            error_msg = str(e)
+            if "do not converge" in error_msg:
+                print(f"[ECC] SKIP: convergence failed (frames too different)")
+            else:
+                print(f"[ECC] FAIL: {error_msg}")
             return None, 0
 
 
