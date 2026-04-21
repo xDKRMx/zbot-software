@@ -152,7 +152,7 @@ class PanoramaConfig:
     detector_type: str = "orb"  # orb or sift (z-bot-map)
     akaze_threshold: float = 0.0001  # Not used (ORB/SIFT detector now)
     ransac_threshold: float = 5.0
-    min_inliers: int = 3  # ORB detector optimized for thermal (was 4)
+    min_inliers: int = 0  # Allow ECC-only matches for low-texture thermal (was 3)
     use_ecc_fallback: bool = True  # z-bot-map ECC refinement
     blend_mode: str = "best"  # best, soft, or simple (z-bot-map integration)
     temporal_smoothing: float = 0.5  # Anti-Picasso: 0.0=instant switch, 0.5=heavy smooth
@@ -225,7 +225,9 @@ class FeatureAligner:
                 self._detector = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8)
                 self._norm = cv2.NORM_HAMMING
         else:
-            self._detector = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8)
+            # Optimized for thermal/low-contrast: more features, lower scale
+            self._detector = cv2.ORB_create(nfeatures=2000, scaleFactor=1.1, nlevels=12, 
+                                            edgeThreshold=10, patchSize=31)
             self._norm = cv2.NORM_HAMMING
         
         self._matcher = cv2.BFMatcher(self._norm, crossCheck=False)
@@ -253,11 +255,12 @@ class FeatureAligner:
         kp1, des1 = self._detector.detectAndCompute(g1, None)
         kp2, des2 = self._detector.detectAndCompute(g2, None)
 
-        if des1 is None or des2 is None or len(kp1) < 3 or len(kp2) < 3:
-            print(f"[FEATURE] SKIP: kp1={len(kp1) if kp1 else 0}, kp2={len(kp2) if kp2 else 0}, des1={des1 is not None}, des2={des2 is not None}")
-            # z-bot-map ECC fallback for low-texture scenes
+        # Allow ECC fallback for low-texture thermal scenes
+        if des1 is None or des2 is None or len(kp1) < self._min_inliers or len(kp2) < self._min_inliers:
             if self._use_ecc:
+                print(f"[FEATURE] Low features (kp1={len(kp1) if kp1 else 0}, kp2={len(kp2) if kp2 else 0}), trying ECC...")
                 return self._ecc_fallback(g1, g2)
+            print(f"[FEATURE] SKIP: kp1={len(kp1) if kp1 else 0}, kp2={len(kp2) if kp2 else 0}")
             return None, 0
 
         raw = self._matcher.knnMatch(des1, des2, k=2)
