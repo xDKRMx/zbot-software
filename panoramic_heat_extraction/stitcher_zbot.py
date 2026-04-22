@@ -83,12 +83,12 @@ class ThermalMapper:
             use_ecc=False,
             disable_flow=True,
             min_ecc=0.85,
-            max_translation_factor=1.5,
+            max_translation_factor=2.5,   # increased: allows larger left/right moves
             max_rotation_jump_deg=75.0,
-            min_scale=0.6,
-            max_scale=1.5,
-            min_determinant=0.2,
-            max_determinant=5.0,
+            min_scale=0.5,                # loosened: handles depth changes
+            max_scale=2.0,                # loosened: handles depth changes
+            min_determinant=0.1,
+            max_determinant=10.0,
         )
         
         self.crop = parse_crop(None)

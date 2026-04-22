@@ -376,9 +376,9 @@ class ThermalWebcamMapper:
         return colored
 
 
-# GUI Constants
-PANEL_W = 480
-PANEL_H = 360
+# GUI Constants (KÜÇÜLTÜLDÜ - ekrana sığsın)
+PANEL_W = 320
+PANEL_H = 240
 UPDATE_MS = 100
 
 
@@ -679,7 +679,7 @@ def main():
     parser.add_argument("--canvas-pad", type=int, default=120)
     parser.add_argument("--max-canvas-mp", type=float, default=64.0)
     parser.add_argument("--detector", choices=("sift", "orb"), default="orb")
-    parser.add_argument("--nfeatures", type=int, default=2000)
+    parser.add_argument("--nfeatures", type=int, default=500)
     parser.add_argument("--model", choices=("translation", "partial-affine", "affine", "homography"),
                        default="partial-affine")
     parser.add_argument("--ratio", type=float, default=0.75)

@@ -37,9 +37,11 @@ class ThermalPanoramaGUI:
         self.root = root
         self.args = args
         
-        self.root.title("Z-BOT Thermal Panorama (z-bot-map)")
+        self.root.title("Z-BOT Thermal Panorama (100% z-bot-map)")
         self.root.configure(bg="#1e1e2e")
         self.root.resizable(False, False)
+        # Set initial window size explicitly to prevent oversized startup
+        self.root.geometry(f"{PANEL_W * 2 + 48}x{PANEL_H + 160}")
         
         # State
         self.running = False
@@ -52,6 +54,16 @@ class ThermalPanoramaGUI:
         # Video mode
         self.video_file: Optional[str] = None
         self.is_video_mode = False
+        
+        # Thread-safe frame buffers to prevent GUI freezing
+        self._latest_rgb: Optional[np.ndarray] = None
+        self._latest_thermal: Optional[np.ndarray] = None
+        self._latest_heatmap: Optional[np.ndarray] = None
+        self._latest_source_view: Optional[np.ndarray] = None
+        self._latest_status: str = ""
+        self._latest_stats: str = ""
+        self._frame_lock = __import__('threading').Lock()
+        self._processing = False
         
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -67,7 +79,7 @@ class ThermalPanoramaGUI:
         top = tk.Frame(self.root, bg="#313244", pady=5)
         top.pack(fill="x")
         
-        tk.Label(top, text="Z-BOT Thermal Panorama (z-bot-map)", 
+        tk.Label(top, text="Z-BOT Thermal Panorama (100% z-bot-map algorithm)", 
                  font=("Helvetica", 11, "bold"),
                  bg="#313244", fg="#cdd6f4").pack(side="left", padx=10)
         
@@ -213,10 +225,10 @@ class ThermalPanoramaGUI:
             canvas_pad=120,
             max_canvas_mp=64.0,
             detector="orb",
-            nfeatures=2000,
+            nfeatures=3000,
             memory_alpha=0.45,
-            anchor_step_px=8.0,
-            anchor_rotation_deg=1.0,
+            anchor_step_px=6.0,
+            anchor_rotation_deg=1.5,
             lock_small_motion_updates=True,
         )
         
@@ -304,59 +316,94 @@ class ThermalPanoramaGUI:
             self.status_var.set(f"Exported → {Path(path).name}")
     
     def _refresh_loop(self):
-        """Main loop - z-bot-map style (called from Tk event loop)."""
+        """Main loop — camera read on main thread, heavy processing on worker thread."""
         if self.running and self.cap_rgb:
-            # Read frame
             ret, frame_rgb = self.cap_rgb.read()
             if not ret:
                 if self.is_video_mode:
                     self._stop()
                     self.status_var.set("Video complete - press Export to save")
+                self.root.after(UPDATE_MS, self._refresh_loop)
                 return
-            
-            # Read thermal (if available)
+
             frame_thermal = None
             if self.cap_thermal:
                 ret_t, frame_thermal = self.cap_thermal.read()
                 if not ret_t:
                     frame_thermal = None
-            
-            # Process at capture_fps rate
+
+            # Always show live camera (non-blocking)
+            with self._frame_lock:
+                self._latest_rgb = frame_rgb.copy()
+                if frame_thermal is not None:
+                    self._latest_thermal = frame_thermal.copy()
+
+            # Dispatch heavy processing to worker thread (non-blocking)
             now = time.time()
-            if (now - self.last_process_time) >= self.process_interval:
+            if (not self._processing and
+                    (now - self.last_process_time) >= self.process_interval):
                 self.last_process_time = now
-                
-                # Prepare thermal data
+                self._processing = True
+
                 use_thermal = self.source_var.get() == "thermal"
                 thermal_gray = None
                 if use_thermal and frame_thermal is not None:
                     thermal_gray = cv2.cvtColor(frame_thermal, cv2.COLOR_BGR2GRAY)
                 elif not use_thermal:
                     thermal_gray = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2GRAY)
-                
-                # z-bot-map process
-                processed_view = self.mapper.process(frame_rgb, thermal_gray, now)
-                
-                # Update displays
-                self._put_image(self.cam_label, processed_view)
-                
-                heatmap = self.mapper.get_thermal_heatmap()
-                if heatmap.size > 0:
-                    self._put_image(self.map_label, heatmap)
-                
-                # Update stats
-                self.stats_var.set(
-                    f"Stitched: {self.mapper.mapped_frames}  |  "
-                    f"Tracked: {self.mapper.tracked_frames}  |  "
-                    f"Rejected: {self.mapper.rejected_frames}"
-                )
-                self.status_var.set(f"z-bot-map: {self.mapper.status}")
-            else:
-                # Just update camera view
-                self._put_image(self.cam_label, frame_rgb)
-        
-        # Schedule next refresh
+
+                import threading as _threading
+                _threading.Thread(
+                    target=self._process_worker,
+                    args=(frame_rgb.copy(), thermal_gray, now),
+                    daemon=True,
+                ).start()
+
+        # Update UI from latest buffers (always runs, never blocks)
+        with self._frame_lock:
+            rgb = self._latest_rgb
+            source_view = self._latest_source_view
+            heatmap = self._latest_heatmap
+            status = self._latest_status
+            stats = self._latest_stats
+
+        if source_view is not None:
+            self._put_image(self.cam_label, source_view)
+        elif rgb is not None:
+            self._put_image(self.cam_label, rgb)
+
+        if heatmap is not None and heatmap.size > 0:
+            self._put_image(self.map_label, heatmap)
+
+        if status:
+            self.status_var.set(status)
+        if stats:
+            self.stats_var.set(stats)
+
         self.root.after(UPDATE_MS, self._refresh_loop)
+
+    def _process_worker(self, frame_rgb: np.ndarray,
+                        thermal_gray, timestamp_sec: float):
+        """Heavy processing in background thread — never touches Tkinter."""
+        try:
+            processed_view = self.mapper.process(frame_rgb, thermal_gray, timestamp_sec)
+            heatmap = self.mapper.get_thermal_heatmap()
+            stats = (
+                f"Stitched: {self.mapper.mapped_frames}  |  "
+                f"Tracked: {self.mapper.tracked_frames}  |  "
+                f"Rejected: {self.mapper.rejected_frames}"
+            )
+            status = f"z-bot-map: {self.mapper.status}"
+            with self._frame_lock:
+                self._latest_source_view = processed_view
+                self._latest_heatmap = heatmap if heatmap.size > 0 else self._latest_heatmap
+                self._latest_status = status
+                self._latest_stats = stats
+        except Exception as e:
+            with self._frame_lock:
+                self._latest_status = f"error: {e}"
+        finally:
+            self._processing = False
     
     def _on_close(self):
         """Handle window close."""
