@@ -474,7 +474,12 @@ class CanvasManager:
     def _blend_best(self, gray: np.ndarray, gray_bgr: Optional[np.ndarray],
                     H_c: np.ndarray, warped: np.ndarray, 
                     new_data: np.ndarray, frame_quality: float) -> None:
-        """z-bot-map best blend with temporal smoothing (anti-Picasso)."""
+        """z-bot-map best blend with memory canvas temporal smoothing.
+        
+        Uses exponential moving average (EMA) approach from z-bot-map:
+        - First visit: direct write
+        - Revisit: blend old * (1-alpha) + new * alpha
+        """
         ch, cw = self._canvas.shape
         
         # Compute detail score for this frame
@@ -499,47 +504,32 @@ class CanvasManager:
             borderMode=cv2.BORDER_CONSTANT, borderValue=0
         )
         
-        # ANTI-PICASSO: Temporal smoothing for overlap regions
+        # Memory canvas approach (z-bot-map style)
         revisit = new_data & self._visited
         if not revisit.any():
             return
         
-        # Compute score difference
-        score_diff = warped_score[revisit] - self._detail_score[revisit]
+        # Compute which pixels should be updated based on detail score
+        better_mask = warped_score[revisit] > self._detail_score[revisit]
         
-        # Strong improvement: use new value with slight smoothing
-        strong_better = score_diff > 0.15  # Significant improvement
-        if strong_better.any():
+        if self._temporal_smoothing > 0.0 and better_mask.any():
+            # EMA blending: old * (1-alpha) + new * alpha
             revisit_idx = np.where(revisit)
-            strong_idx = (revisit_idx[0][strong_better], revisit_idx[1][strong_better])
+            better_idx = (revisit_idx[0][better_mask], revisit_idx[1][better_mask])
             
-            # Temporal smoothing: blend with existing canvas
-            alpha = 1.0 - self._temporal_smoothing  # New frame weight
-            self._canvas[strong_idx] = (
-                alpha * warped[strong_idx] + 
-                self._temporal_smoothing * self._canvas[strong_idx]
-            )
-            self._detail_score[strong_idx] = warped_score[strong_idx]
-        
-        # Moderate improvement: weighted blend
-        moderate_better = (score_diff > 0.05) & (score_diff <= 0.15)
-        if moderate_better.any():
+            old_pixels = self._canvas[better_idx].astype(np.float32)
+            new_pixels = warped[better_idx].astype(np.float32)
+            
+            # temporal_smoothing = alpha (weight of new observation)
+            blended = old_pixels * (1.0 - self._temporal_smoothing) + new_pixels * self._temporal_smoothing
+            self._canvas[better_idx] = np.clip(blended, 0, 255).astype(np.float32)
+            self._detail_score[better_idx] = warped_score[better_idx]
+        elif better_mask.any():
+            # No smoothing: direct replacement
             revisit_idx = np.where(revisit)
-            mod_idx = (revisit_idx[0][moderate_better], revisit_idx[1][moderate_better])
-            
-            # Stronger smoothing for moderate changes
-            alpha = 0.5  # 50/50 blend
-            self._canvas[mod_idx] = (
-                alpha * warped[mod_idx] + 
-                (1.0 - alpha) * self._canvas[mod_idx]
-            )
-            self._detail_score[mod_idx] = (
-                alpha * warped_score[mod_idx] +
-                (1.0 - alpha) * self._detail_score[mod_idx]
-            )
-        
-        # Small difference: keep existing (prevent flicker)
-        # score_diff <= 0.05: no change
+            better_idx = (revisit_idx[0][better_mask], revisit_idx[1][better_mask])
+            self._canvas[better_idx] = warped[better_idx]
+            self._detail_score[better_idx] = warped_score[better_idx]
 
     def expand_if_needed(self, margin: int = 50) -> None:
         """Expand canvas if content is within margin pixels of any edge."""
