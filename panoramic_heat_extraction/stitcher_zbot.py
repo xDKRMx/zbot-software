@@ -369,7 +369,7 @@ class ThermalMapper:
             self.lost_streak = 0
             source = "ECC" if estimate.used_ecc else "flow" if estimate.used_flow else "features"
             self.status = (
-                f"{source}  inliers={estimate.inlier_count}/{estimate.match_count}  "
+                f"{source}  inliers={estimate.num_inliers}/{estimate.num_matches}  "
                 f"ratio={estimate.inlier_ratio:.2f}  paint={paint_mode}"
             )
         else:
