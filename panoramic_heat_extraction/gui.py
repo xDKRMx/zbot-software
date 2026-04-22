@@ -364,7 +364,7 @@ class ThermalWebcamMapper:
                      * (255.0 / denom)).astype(np.uint8)
         stretched[~valid] = 0
         colored = cv2.applyColorMap(stretched, cv2.COLORMAP_JET)
-        colored[~valid] = [0, 0, 0]
+        colored[~valid, :] = 0  # FIX: proper 3D array indexing
         
         # Crop to valid region
         if np.any(self.thermal_mask):
