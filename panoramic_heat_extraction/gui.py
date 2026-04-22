@@ -1,1136 +1,387 @@
-"""Panoramic Heat Extraction GUI — Z-BOT
+"""Z-BOT Thermal Panorama GUI - 100% z-bot-map architecture
 
-
-
-Left  : live camera feed (always visible after Start)
-
-Right : real-time growing 2D thermal heat map (fixed size, content scales inside)
-
-
-
-Usage:
-
-    python gui.py                           # webcam only
-
-    python gui.py --rgb 0 --thermal 1      # webcam + IR camera
-
-    python gui.py --rgb 0 --thermal 1 --source thermal
-
-    python gui.py --rgb 0 --capture-fps 1.0
-
+Minimal GUI wrapper around ThermalMapper (port of LiveWebcamMapper).
+NO complex threading, NO worker queues - just direct processing like live_webcam_map.py.
 """
-
-
 
 from __future__ import annotations
 
-
-
 import argparse
-
-import sys
-
-import threading
-
 import time
-
+import tkinter as tk
+from tkinter import filedialog, messagebox
 from pathlib import Path
-
 from typing import Optional
 
-
-
 import cv2
-
 import numpy as np
 
-
-
 try:
-
-    import tkinter as tk
-
-    from tkinter import messagebox, filedialog
-
     from PIL import Image, ImageTk
-
 except ImportError:
+    print("[ERROR] Install Pillow: pip install Pillow")
+    exit(1)
 
-    print("[ERROR] Install Pillow:  pip install Pillow")
+from stitcher_zbot import ThermalMapper
 
-    sys.exit(1)
-
-
-
-from stitcher import PanoramaConfig, PanoramaStitcher
-
-
-
-# ── Layout constants ─────────────────────────────────────────────────────────
-
-PANEL_W = 480   # width of each panel (camera + heatmap)
-
-PANEL_H = 360   # height of each panel
-
-UPDATE_MS = 80  # GUI refresh ~12 fps
+# GUI Constants
+PANEL_W = 480
+PANEL_H = 360
+UPDATE_MS = 100  # ~10 fps
 
 
-
-
-
-class PanoramaGUI:
-
-    def __init__(self, root: tk.Tk, config: PanoramaConfig) -> None:
-
-        self._cfg = config
-
-        self._root = root
-
-        self._root.title("Z-BOT Panoramic Heat Extraction")
-
-        self._root.resizable(False, False)
-
-        self._root.configure(bg="#1e1e2e")
-
-
-
-        self._running = False
-
-        self._cap_rgb: Optional[cv2.VideoCapture] = None
-
-        self._cap_thermal: Optional[cv2.VideoCapture] = None
-
-        self._stitcher: Optional[PanoramaStitcher] = None
-
-        self._cam_thread: Optional[threading.Thread] = None
-
-        self._stop_evt = threading.Event()
-
-        self._video_file: Optional[str] = None  # Video import path
-
-        self._is_video_mode = False  # True if processing video file
-
-
-
-        self._latest_rgb: Optional[np.ndarray] = None
-
-        self._latest_heatmap: Optional[np.ndarray] = None
-
-        self._frame_lock = threading.Lock()
-
-        self._last_cap_ts = 0.0
-
-
-
+class ThermalPanoramaGUI:
+    """Simple GUI for z-bot-map thermal mapper."""
+    
+    def __init__(self, root: tk.Tk, args: argparse.Namespace):
+        self.root = root
+        self.args = args
+        
+        self.root.title("Z-BOT Thermal Panorama (z-bot-map)")
+        self.root.configure(bg="#1e1e2e")
+        self.root.resizable(False, False)
+        
+        # State
+        self.running = False
+        self.cap_rgb: Optional[cv2.VideoCapture] = None
+        self.cap_thermal: Optional[cv2.VideoCapture] = None
+        self.mapper: Optional[ThermalMapper] = None
+        self.last_process_time = 0.0
+        self.process_interval = 1.0 / args.capture_fps
+        
+        # Video mode
+        self.video_file: Optional[str] = None
+        self.is_video_mode = False
+        
         self._build_ui()
-
-        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-
-
-    # ── UI ───────────────────────────────────────────────────────────────────
-
-
-
-    def _build_ui(self) -> None:
-
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        
+        # Start refresh loop
+        self.root.after(UPDATE_MS, self._refresh_loop)
+    
+    def _build_ui(self):
+        """Build UI (simple z-bot-map style)."""
         PAD = 8
-
-
-
-        # ── Top bar ──────────────────────────────────────────────────────────
-
-        top = tk.Frame(self._root, bg="#313244", pady=5)
-
+        
+        # Top bar
+        top = tk.Frame(self.root, bg="#313244", pady=5)
         top.pack(fill="x")
-
-
-
-        tk.Label(top, text="Z-BOT  Panoramic Heat Extraction",
-
+        
+        tk.Label(top, text="Z-BOT Thermal Panorama (z-bot-map)", 
                  font=("Helvetica", 11, "bold"),
-
                  bg="#313244", fg="#cdd6f4").pack(side="left", padx=10)
-
-
-
-        self._btn_start = tk.Button(
-
-            top, text="▶ Start", width=9,
-
+        
+        # Buttons
+        self.btn_start = tk.Button(
+            top, text="▶ Start", width=8,
             bg="#a6e3a1", fg="#1e1e2e", font=("Helvetica", 9, "bold"),
-
             relief="flat", cursor="hand2", command=self._toggle)
-
-        self._btn_start.pack(side="right", padx=4)
-
-
-
-        self._btn_export = tk.Button(
-
-            top, text="💾 Export", width=9,
-
+        self.btn_start.pack(side="right", padx=4)
+        
+        self.btn_export = tk.Button(
+            top, text="💾 Export", width=8,
             bg="#89b4fa", fg="#1e1e2e", font=("Helvetica", 9, "bold"),
-
             relief="flat", cursor="hand2", state="disabled", command=self._export)
-
-        self._btn_export.pack(side="right", padx=4)
-
-
-
-        self._btn_reset = tk.Button(
-
-            top, text="🔄 Reset", width=9,
-
+        self.btn_export.pack(side="right", padx=4)
+        
+        self.btn_reset = tk.Button(
+            top, text="🔄 Reset", width=8,
             bg="#f38ba8", fg="#1e1e2e", font=("Helvetica", 9, "bold"),
-
-            relief="flat", cursor="hand2", state="disabled",
-
-            command=self._reset_panorama)
-
-        self._btn_reset.pack(side="right", padx=4)
-
-
-
-        # Video import button
-
-        self._btn_import = tk.Button(
-
+            relief="flat", cursor="hand2", state="disabled", command=self._reset)
+        self.btn_reset.pack(side="right", padx=4)
+        
+        self.btn_import = tk.Button(
             top, text="📁 Import Video", width=12,
-
             bg="#fab387", fg="#1e1e2e", font=("Helvetica", 9, "bold"),
-
             relief="flat", cursor="hand2", command=self._import_video)
-
-        self._btn_import.pack(side="right", padx=4)
-
-
-
-        # ── Source selector ───────────────────────────────────────────────────
-
-        src = tk.Frame(self._root, bg="#1e1e2e", pady=3)
-
+        self.btn_import.pack(side="right", padx=4)
+        
+        # Source selector
+        src = tk.Frame(self.root, bg="#1e1e2e", pady=3)
         src.pack(fill="x")
-
-
-
+        
         tk.Label(src, text="Heat source:", bg="#1e1e2e",
-
                  fg="#a6adc8", font=("Helvetica", 9)).pack(side="left", padx=10)
-
-
-
-        self._source_var = tk.StringVar(value="rgb")
-
-        has_thermal = self._cfg.thermal_camera_idx >= 0
-
-
-
-        for val, txt in [("rgb", "RGB camera"), ("thermal", "Thermal / IR camera")]:
-
-            rb = tk.Radiobutton(
-
-                src, text=txt, variable=self._source_var, value=val,
-
-                bg="#1e1e2e", fg="#cdd6f4", selectcolor="#45475a",
-
-                activebackground="#1e1e2e",
-
-                state="normal" if (val == "rgb" or has_thermal) else "disabled")
-
-            rb.pack(side="left", padx=4)
-
-
-
-        if not has_thermal:
-
-            tk.Label(src, text="(no IR camera configured)",
-
-                     bg="#1e1e2e", fg="#585b70",
-
-                     font=("Helvetica", 8, "italic")).pack(side="left")
-
-
-
-        # ── Two panels side by side ───────────────────────────────────────────
-
-        panels = tk.Frame(self._root, bg="#1e1e2e", padx=PAD, pady=PAD)
-
-        panels.pack()
-
-
-
-        # Left — live camera
-
-        lf = tk.Frame(panels, bg="#1e1e2e")
-
-        lf.pack(side="left", padx=(0, PAD))
-
-
-
-        tk.Label(lf, text="Live Camera", bg="#1e1e2e",
-
-                 fg="#89b4fa", font=("Helvetica", 9, "bold")).pack(anchor="w")
-
-
-
-        self._cam_label = tk.Label(lf, bg="#11111b",
-
-                                   width=PANEL_W, height=PANEL_H,
-
-                                   relief="flat")
-
-        self._cam_label.pack()
-
-        # Show placeholder immediately
-
-        self._show_placeholder(self._cam_label, "Press  ▶ Start")
-
-
-
-        # Right — heat map
-
-        rf = tk.Frame(panels, bg="#1e1e2e")
-
-        rf.pack(side="left")
-
-
-
-        tk.Label(rf, text="Thermal Heat Map  (builds as robot moves)",
-
-                 bg="#1e1e2e", fg="#f38ba8",
-
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-
-
-
-        self._map_label = tk.Label(rf, bg="#11111b",
-
-                                   width=PANEL_W, height=PANEL_H,
-
-                                   relief="flat")
-
-        self._map_label.pack()
-
-        self._show_placeholder(self._map_label, "Waiting for frames…")
-
-
-
-        # ── Status bar ────────────────────────────────────────────────────────
-
-        sb = tk.Frame(self._root, bg="#313244", pady=3)
-
-        sb.pack(fill="x")
-
-
-
-        self._status_var = tk.StringVar(value="Ready")
-
-        tk.Label(sb, textvariable=self._status_var,
-
-                 bg="#313244", fg="#a6adc8",
-
-                 font=("Helvetica", 9), anchor="w").pack(side="left", padx=10)
-
-
-
-        self._stats_var = tk.StringVar(value="")
-
-        tk.Label(sb, textvariable=self._stats_var,
-
-                 bg="#313244", fg="#a6e3a1",
-
-                 font=("Helvetica", 9), anchor="e").pack(side="right", padx=10)
-
-
-
-    def _show_placeholder(self, label: tk.Label, text: str) -> None:
-
+        
+        self.source_var = tk.StringVar(value="rgb")
+        tk.Radiobutton(src, text="RGB camera", variable=self.source_var,
+                      value="rgb", bg="#1e1e2e", fg="#cdd6f4",
+                      selectcolor="#313244", font=("Helvetica", 9)).pack(side="left", padx=5)
+        tk.Radiobutton(src, text="Thermal/IR camera", variable=self.source_var,
+                      value="thermal", bg="#1e1e2e", fg="#cdd6f4",
+                      selectcolor="#313244", font=("Helvetica", 9)).pack(side="left")
+        
+        # Panels
+        panels = tk.Frame(self.root, bg="#1e1e2e")
+        panels.pack(pady=PAD)
+        
+        # Live Camera
+        cam_frame = tk.Frame(panels, bg="#313244")
+        cam_frame.pack(side="left", padx=PAD)
+        tk.Label(cam_frame, text="Live Camera", bg="#313244", fg="#a6adc8",
+                font=("Helvetica", 9)).pack()
+        self.cam_label = tk.Label(cam_frame, bg="#11111b", width=PANEL_W, height=PANEL_H)
+        self.cam_label.pack()
+        
+        # Thermal Heatmap
+        map_frame = tk.Frame(panels, bg="#313244")
+        map_frame.pack(side="left", padx=PAD)
+        tk.Label(map_frame, text="Thermal Heat Map (z-bot-map memory canvas)",
+                bg="#313244", fg="#a6adc8", font=("Helvetica", 9)).pack()
+        self.map_label = tk.Label(map_frame, bg="#11111b", width=PANEL_W, height=PANEL_H)
+        self.map_label.pack()
+        
+        # Status bar
+        status_bar = tk.Frame(self.root, bg="#313244", pady=5)
+        status_bar.pack(fill="x")
+        
+        self.status_var = tk.StringVar(value="Press ▶ Start to begin")
+        tk.Label(status_bar, textvariable=self.status_var,
+                bg="#313244", fg="#cdd6f4", font=("Helvetica", 9),
+                anchor="w").pack(side="left", padx=10, fill="x", expand=True)
+        
+        self.stats_var = tk.StringVar(value="")
+        tk.Label(status_bar, textvariable=self.stats_var,
+                bg="#313244", fg="#a6e3a1", font=("Helvetica", 9),
+                anchor="e").pack(side="right", padx=10)
+        
+        # Initial placeholders
+        self._show_placeholder(self.cam_label, "Press ▶ Start")
+        self._show_placeholder(self.map_label, "Waiting for frames…")
+    
+    def _show_placeholder(self, label: tk.Label, text: str):
+        """Show placeholder text."""
         img = np.zeros((PANEL_H, PANEL_W, 3), dtype=np.uint8)
-
-        img[:] = (17, 17, 27)  # #11111b
-
+        img[:] = (17, 17, 27)
         tw, th = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0]
-
-        cv2.putText(img, text,
-
-                    ((PANEL_W - tw) // 2, (PANEL_H + th) // 2),
-
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (88, 91, 112), 1)
-
+        cv2.putText(img, text, ((PANEL_W - tw) // 2, (PANEL_H + th) // 2),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.55, (88, 91, 112), 1)
         self._put_image(label, img)
-
-
-
-    # ── Start / Stop ─────────────────────────────────────────────────────────
-
-
-
-    def _toggle(self) -> None:
-
-        if self._running:
-
-            self._stop()
-
-        else:
-
-            self._btn_start.config(state="disabled")
-
-            self._status_var.set("Opening camera…")
-
-            threading.Thread(target=self._start, daemon=True).start()
-
-
-
-    def _import_video(self) -> None:
-
-        """Import video file for processing (MP4/AVI/MOV)."""
-
-        if self._running:
-
-            messagebox.showwarning("Stop First", "Please stop current capture before importing video.")
-
-            return
-
-
-
-        filetypes = [
-
-            ("Video Files", "*.mp4 *.avi *.mov *.mkv *.wmv"),
-
-            ("MP4 Videos", "*.mp4"),
-
-            ("AVI Videos", "*.avi"),
-
-            ("All Files", "*.*")
-
-        ]
-
-
-
-        filepath = filedialog.askopenfilename(
-
-            title="Select Video File",
-
-            filetypes=filetypes
-
-        )
-
-
-
-        if not filepath:
-
-            return
-
-
-
-        # Test if video can be opened
-
-        test_cap = cv2.VideoCapture(filepath)
-
-        if not test_cap.isOpened():
-
-            messagebox.showerror("Video Error", f"Cannot open video file:\n{filepath}")
-
-            return
-
-
-
-        # Get video info
-
-        total_frames = int(test_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        fps = test_cap.get(cv2.CAP_PROP_FPS)
-
-        test_cap.release()
-
-
-
-        # Confirm
-
-        msg = f"Video loaded:\n{Path(filepath).name}\n\nFrames: {total_frames}\nFPS: {fps:.1f}\n\nProcess this video?"
-
-        if not messagebox.askyesno("Import Video", msg):
-
-            return
-
-
-
-        self._video_file = filepath
-
-        self._is_video_mode = True
-
-        self._status_var.set(f"Video loaded: {Path(filepath).name} ({total_frames} frames)")
-
-        self._btn_import.config(bg="#a6e3a1")  # Green = loaded
-
-        print(f"[VIDEO] Loaded: {filepath}")
-
-
-
-    def _start(self) -> None:
-
-        # Runs in background thread — NO direct Tkinter calls here
-
-        idx = self._cfg.rgb_camera_idx
-
-
-
-        # Windows uses index directly, Linux uses /dev/videoX path
-
-        if sys.platform == "win32":
-
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-
-        else:
-
-            cap = cv2.VideoCapture(f"/dev/video{idx}")
-
-
-
-        if not cap.isOpened():
-
-            self._root.after(0, lambda: messagebox.showerror(
-
-                "Camera Error", f"Cannot open camera {idx}"))
-
-            self._root.after(0, lambda: self._btn_start.config(
-
-                state="normal", text="▶ Start", bg="#a6e3a1"))
-
-            self._root.after(0, lambda: self._status_var.set("Ready"))
-
-            return
-
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self._cfg.width))
-
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._cfg.height))
-
-        self._cap_rgb = cap
-
-
-
-        # Open thermal camera
-
-        self._cap_thermal = None
-
-        tidx = self._cfg.thermal_camera_idx
-
-        if tidx >= 0:
-
-            if sys.platform == "win32":
-
-                tcap = cv2.VideoCapture(tidx, cv2.CAP_DSHOW)
-
-            else:
-
-                tcap = cv2.VideoCapture(f"/dev/video{tidx}")
-
-            if tcap.isOpened():
-
-                tcap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self._cfg.width))
-
-                tcap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._cfg.height))
-
-                self._cap_thermal = tcap
-
-            else:
-
-                self._root.after(0, lambda: messagebox.showwarning(
-
-                    "Thermal Camera", f"Cannot open thermal {tidx}. Using RGB."))
-
-
-
-        # Create stitcher
-
-        self._stitcher = PanoramaStitcher(self._cfg, on_update=self._on_stitch_update)
-
-        self._stitcher.start()
-
-
-
-        self._running = True
-
-        self._stop_evt.clear()
-
-        self._last_cap_ts = 0.0
-
-
-
-        if self._is_video_mode:
-
-            self._cam_thread = threading.Thread(target=self._video_loop, daemon=True)
-
-        else:
-
-            self._cam_thread = threading.Thread(target=self._camera_loop, daemon=True)
-
-        self._cam_thread.start()
-
-
-
-        # Update UI from main thread
-
-        self._root.after(0, lambda: self._btn_start.config(
-
-            text="⏹ Stop", bg="#f38ba8", state="normal"))
-
-        self._root.after(0, lambda: self._btn_export.config(state="disabled"))
-
-        self._root.after(0, lambda: self._btn_reset.config(state="disabled"))
-
-        self._root.after(0, lambda: self._status_var.set(
-
-            "Running — move the robot across the surface"))
-
-        self._root.after(UPDATE_MS, self._refresh_ui)
-
-
-
-    def _stop(self) -> None:
-
-        self._running = False
-
-        self._stop_evt.set()
-
-        # Release cameras in background to avoid blocking main thread
-
-        def _cleanup():
-
-            if self._cam_thread:
-
-                self._cam_thread.join(timeout=3.0)
-
-            if self._cap_rgb:
-
-                self._cap_rgb.release()
-
-                self._cap_rgb = None
-
-            if self._cap_thermal:
-
-                self._cap_thermal.release()
-
-                self._cap_thermal = None
-
-            if self._stitcher:
-
-                self._stitcher.stop()
-
-            self._root.after(0, lambda: self._btn_start.config(
-
-                text="▶ Start", bg="#a6e3a1", state="normal"))
-
-            self._root.after(0, lambda: self._btn_export.config(state="normal"))
-
-            self._root.after(0, lambda: self._btn_reset.config(state="normal"))
-
-            status_msg = "Stopped — press Export to save"
-
-            if self._is_video_mode:
-
-                status_msg = "Video processing complete — press Export to save"
-
-            self._root.after(0, lambda: self._status_var.set(status_msg))
-
-        threading.Thread(target=_cleanup, daemon=True).start()
-
-
-
-    def _reset_panorama(self) -> None:
-
-        if self._running:
-
-            return
-
-        self._stitcher = None
-
-        self._video_file = None
-
-        self._is_video_mode = False
-
-        self._btn_import.config(bg="#fab387")  # Orange = no video
-
-        with self._frame_lock:
-
-            self._latest_heatmap = None
-
-        self._show_placeholder(self._map_label, "Waiting for frames…")
-
-        self._show_placeholder(self._cam_label, "Press  ▶ Start")
-
-        self._stats_var.set("")
-
-        self._status_var.set("Reset — press Start")
-
-        self._btn_export.config(state="disabled")
-
-        self._btn_reset.config(state="disabled")
-
-
-
-    # ── Camera loop (background thread) ──────────────────────────────────────
-
-
-
-    def _camera_loop(self) -> None:
-
-        min_interval = 1.0 / max(self._cfg.capture_fps, 0.1)
-
-        use_thermal = (self._source_var.get() == "thermal"
-
-                       and self._cap_thermal is not None)
-
-
-
-        while self._running and not self._stop_evt.is_set():
-
-            ret, frame_rgb = self._cap_rgb.read()
-
-            if not ret or frame_rgb is None:
-
-                time.sleep(0.05)
-
-                continue
-
-
-
-            frame_thermal = None
-
-            if self._cap_thermal is not None:
-
-                ret_t, frame_thermal = self._cap_thermal.read()
-
-                if not ret_t:
-
-                    frame_thermal = None
-
-
-
-            with self._frame_lock:
-
-                self._latest_rgb = frame_rgb.copy()
-
-
-
-            # Feed stitcher at capture_fps rate
-
-            now = time.time()
-
-            if self._stitcher and (now - self._last_cap_ts) >= min_interval:
-
-                self._last_cap_ts = now
-
-                heat_src = (frame_thermal
-
-                            if use_thermal and frame_thermal is not None
-
-                            else frame_rgb)
-
-                thermal_gray = cv2.cvtColor(heat_src, cv2.COLOR_BGR2GRAY)
-
-                self._stitcher.feed_frame(frame_rgb.copy(), thermal_gray, now)
-
-
-
-            time.sleep(0.01)
-
-
-
-    def _video_loop(self) -> None:
-
-        """Process video file frame-by-frame."""
-
-        if not self._video_file:
-
-            print("[VIDEO] No video file loaded!")
-
-            self._running = False
-
-            return
-
-
-
-        cap = cv2.VideoCapture(self._video_file)
-
-        if not cap.isOpened():
-
-            print(f"[VIDEO] Cannot open: {self._video_file}")
-
-            self._running = False
-
-            return
-
-
-
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-
-        min_interval = 1.0 / self._cfg.capture_fps if self._cfg.capture_fps > 0 else 0.2
-
-
-
-        print(f"[VIDEO] Processing {total_frames} frames @ {fps:.1f} fps (capture rate: {self._cfg.capture_fps} fps)")
-
-
-
-        frame_idx = 0
-
-        processed = 0
-
-        use_thermal = self._source_var.get() == "thermal"
-
-
-
-        try:
-
-            while self._running and cap.isOpened():
-
-                ret, frame_rgb = cap.read()
-
-                if not ret:
-
-                    print("[VIDEO] End of video")
-
-                    break
-
-
-
-                frame_idx += 1
-
-
-
-                # Respect capture_fps
-
-                now = time.time()
-
-                if now - self._last_cap_ts < min_interval:
-
-                    continue
-
-                self._last_cap_ts = now
-
-
-
-                # Resize if needed
-
-                h, w = frame_rgb.shape[:2]
-
-                if w != self._cfg.width or h != self._cfg.height:
-
-                    frame_rgb = cv2.resize(frame_rgb, (self._cfg.width, self._cfg.height))
-
-
-
-                # Generate thermal from RGB (or use actual thermal if available)
-
-                heat_src = frame_rgb
-
-                if use_thermal and self._cap_thermal:
-
-                    ret_t, frame_thermal = self._cap_thermal.read()
-
-                    if ret_t:
-
-                        heat_src = frame_thermal
-
-
-
-                thermal_gray = cv2.cvtColor(heat_src, cv2.COLOR_BGR2GRAY)
-
-
-
-                # Feed to stitcher
-
-                self._stitcher.feed_frame(frame_rgb.copy(), thermal_gray, now)
-
-                processed += 1
-
-
-
-                # Update display
-
-                with self._frame_lock:
-
-                    self._latest_rgb = frame_rgb.copy()
-
-
-
-                # Progress update
-
-                if frame_idx % 10 == 0:
-
-                    progress = (frame_idx / total_frames) * 100 if total_frames > 0 else 0
-
-                    self._root.after(0, lambda p=progress, pr=processed:
-
-                        self._status_var.set(f"Processing video: {p:.1f}% ({pr} frames stitched)"))
-
-
-
-            print(f"[VIDEO] Processing complete: {processed} frames stitched")
-
-
-
-        except Exception as e:
-
-            print(f"[VIDEO] Error: {e}")
-
-        finally:
-
-            cap.release()
-
-            self._running = False
-
-
-
-    # ── Stitch callback (worker thread → stores latest heatmap) ──────────────
-
-
-
-    def _on_stitch_update(self, colored: np.ndarray) -> None:
-
-        with self._frame_lock:
-
-            self._latest_heatmap = colored.copy()
-
-
-
-    # ── GUI refresh (main thread) ─────────────────────────────────────────────
-
-
-
-    def _refresh_ui(self) -> None:
-
-        if not self._running:
-
-            return
-
-
-
-        with self._frame_lock:
-
-            rgb = self._latest_rgb.copy() if self._latest_rgb is not None else None
-
-            hm = self._latest_heatmap.copy() if self._latest_heatmap is not None else None
-
-
-
-        if rgb is not None:
-
-            self._put_image(self._cam_label, rgb)
-
-
-
-        if hm is not None:
-
-            # Add scale bar then fit into fixed panel
-
-            with_bar = self._add_scale_bar(hm)
-
-            self._put_image(self._map_label, with_bar)
-
-
-
-        if self._stitcher:
-
-            s = self._stitcher
-
-            self._stats_var.set(
-
-                f"Stitched: {s.frames_stitched}  |  "
-
-                f"Skipped: {s.frames_skipped}  |  "
-
-                f"Drift: {s.drift_corrections}"
-
-            )
-
-
-
-        self._root.after(UPDATE_MS, self._refresh_ui)
-
-
-
-    def _put_image(self, label: tk.Label, img_bgr: np.ndarray) -> None:
-
-        """Scale img_bgr to fit inside PANEL_W × PANEL_H, then display."""
-
+    
+    def _put_image(self, label: tk.Label, img_bgr: np.ndarray):
+        """Display image in label."""
         h, w = img_bgr.shape[:2]
-
         scale = min(PANEL_W / max(w, 1), PANEL_H / max(h, 1))
-
         nw, nh = int(w * scale), int(h * scale)
-
         resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
-
-
-
-        # Letterbox onto black background
-
+        
         canvas = np.zeros((PANEL_H, PANEL_W, 3), dtype=np.uint8)
-
         canvas[:] = (17, 17, 27)
-
-        y0 = (PANEL_H - nh) // 2
-
-        x0 = (PANEL_W - nw) // 2
-
+        y0, x0 = (PANEL_H - nh) // 2, (PANEL_W - nw) // 2
         canvas[y0:y0+nh, x0:x0+nw] = resized
-
-
-
+        
         img_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-
         pil = Image.fromarray(img_rgb)
-
         tk_img = ImageTk.PhotoImage(pil)
-
-        label.config(image=tk_img, width=PANEL_W, height=PANEL_H)
-
+        label.config(image=tk_img)
         label.image = tk_img
-
-
-
-    def _add_scale_bar(self, img: np.ndarray) -> np.ndarray:
-
-        """Append a small 20px scale bar on the right."""
-
-        h = img.shape[0]
-
-        grad = np.linspace(255, 0, h, dtype=np.uint8).reshape(h, 1)
-
-        bar = cv2.applyColorMap(np.repeat(grad, 20, axis=1), cv2.COLORMAP_JET)
-
-        return np.hstack([img, bar])
-
-
-
-    # ── Export ────────────────────────────────────────────────────────────────
-
-
-
-    def _export(self) -> None:
-
-        if self._stitcher is None:
-
-            messagebox.showinfo("Export", "Nothing to export yet.")
-
-            return
-
-        path = self._stitcher.export()
-
-        if path:
-
-            self._status_var.set(f"Exported → {path.name}")
-
-            messagebox.showinfo("Export complete", f"Saved:\n{path}")
-
-        else:
-
-            messagebox.showwarning("Export", "No frames stitched yet.")
-
-
-
-    # ── Close ─────────────────────────────────────────────────────────────────
-
-
-
-    def _on_close(self) -> None:
-
-        if self._running:
-
+    
+    def _toggle(self):
+        """Toggle start/stop."""
+        if self.running:
             self._stop()
+        else:
+            self._start()
+    
+    def _start(self):
+        """Start capture (z-bot-map style - no threads!)."""
+        if self.running:
+            return
+        
+        # Open cameras
+        if not self.is_video_mode:
+            self.cap_rgb = cv2.VideoCapture(self.args.rgb)
+            if not self.cap_rgb.isOpened():
+                messagebox.showerror("Error", f"Cannot open RGB camera {self.args.rgb}")
+                return
+            
+            if self.args.thermal >= 0:
+                self.cap_thermal = cv2.VideoCapture(self.args.thermal)
+                if not self.cap_thermal.isOpened():
+                    messagebox.showwarning("Warning", f"Cannot open thermal camera {self.args.thermal}")
+                    self.cap_thermal = None
+        else:
+            self.cap_rgb = cv2.VideoCapture(self.video_file)
+            if not self.cap_rgb.isOpened():
+                messagebox.showerror("Error", f"Cannot open video: {self.video_file}")
+                return
+        
+        # Create z-bot-map mapper
+        self.mapper = ThermalMapper(
+            canvas_width=2200,
+            canvas_height=1600,
+            canvas_pad=120,
+            max_canvas_mp=64.0,
+            detector="orb",
+            nfeatures=2000,
+            memory_alpha=0.45,
+            anchor_step_px=8.0,
+            anchor_rotation_deg=1.0,
+            lock_small_motion_updates=True,
+        )
+        
+        self.running = True
+        self.last_process_time = time.time()
+        
+        self.btn_start.config(text="⏹ Stop", bg="#f38ba8")
+        self.btn_export.config(state="disabled")
+        self.btn_reset.config(state="disabled")
+        self.status_var.set("Running - z-bot-map memory canvas active")
+    
+    def _stop(self):
+        """Stop capture."""
+        self.running = False
+        
+        if self.cap_rgb:
+            self.cap_rgb.release()
+            self.cap_rgb = None
+        if self.cap_thermal:
+            self.cap_thermal.release()
+            self.cap_thermal = None
+        
+        self.btn_start.config(text="▶ Start", bg="#a6e3a1")
+        self.btn_export.config(state="normal")
+        self.btn_reset.config(state="normal")
+        self.status_var.set("Stopped - press Export to save or Reset to clear")
+    
+    def _reset(self):
+        """Reset mapper."""
+        if self.running:
+            return
+        
+        if self.mapper:
+            self.mapper.reset()
+        
+        self.video_file = None
+        self.is_video_mode = False
+        self.btn_import.config(bg="#fab387")
+        
+        self._show_placeholder(self.cam_label, "Press ▶ Start")
+        self._show_placeholder(self.map_label, "Waiting for frames…")
+        
+        self.status_var.set("Reset complete - press Start")
+        self.stats_var.set("")
+    
+    def _import_video(self):
+        """Import video file."""
+        if self.running:
+            messagebox.showwarning("Warning", "Stop processing first")
+            return
+        
+        path = filedialog.askopenfilename(
+            title="Select Video",
+            filetypes=[
+                ("Video files", "*.mp4 *.avi *.mov *.mkv *.wmv"),
+                ("All files", "*.*")
+            ]
+        )
+        
+        if path:
+            self.video_file = path
+            self.is_video_mode = True
+            self.btn_import.config(bg="#a6e3a1")
+            self.status_var.set(f"Video loaded: {Path(path).name}")
+    
+    def _export(self):
+        """Export thermal heatmap."""
+        if not self.mapper:
+            messagebox.showinfo("Export", "Nothing to export yet")
+            return
+        
+        heatmap = self.mapper.get_thermal_heatmap()
+        if heatmap.size == 0:
+            messagebox.showwarning("Export", "No frames stitched yet")
+            return
+        
+        path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("All files", "*.*")]
+        )
+        
+        if path:
+            cv2.imwrite(path, heatmap)
+            messagebox.showinfo("Export", f"Saved:\n{path}")
+            self.status_var.set(f"Exported → {Path(path).name}")
+    
+    def _refresh_loop(self):
+        """Main loop - z-bot-map style (called from Tk event loop)."""
+        if self.running and self.cap_rgb:
+            # Read frame
+            ret, frame_rgb = self.cap_rgb.read()
+            if not ret:
+                if self.is_video_mode:
+                    self._stop()
+                    self.status_var.set("Video complete - press Export to save")
+                return
+            
+            # Read thermal (if available)
+            frame_thermal = None
+            if self.cap_thermal:
+                ret_t, frame_thermal = self.cap_thermal.read()
+                if not ret_t:
+                    frame_thermal = None
+            
+            # Process at capture_fps rate
+            now = time.time()
+            if (now - self.last_process_time) >= self.process_interval:
+                self.last_process_time = now
+                
+                # Prepare thermal data
+                use_thermal = self.source_var.get() == "thermal"
+                thermal_gray = None
+                if use_thermal and frame_thermal is not None:
+                    thermal_gray = cv2.cvtColor(frame_thermal, cv2.COLOR_BGR2GRAY)
+                elif not use_thermal:
+                    thermal_gray = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2GRAY)
+                
+                # z-bot-map process
+                processed_view = self.mapper.process(frame_rgb, thermal_gray, now)
+                
+                # Update displays
+                self._put_image(self.cam_label, processed_view)
+                
+                heatmap = self.mapper.get_thermal_heatmap()
+                if heatmap.size > 0:
+                    self._put_image(self.map_label, heatmap)
+                
+                # Update stats
+                self.stats_var.set(
+                    f"Stitched: {self.mapper.mapped_frames}  |  "
+                    f"Tracked: {self.mapper.tracked_frames}  |  "
+                    f"Rejected: {self.mapper.rejected_frames}"
+                )
+                self.status_var.set(f"z-bot-map: {self.mapper.status}")
+            else:
+                # Just update camera view
+                self._put_image(self.cam_label, frame_rgb)
+        
+        # Schedule next refresh
+        self.root.after(UPDATE_MS, self._refresh_loop)
+    
+    def _on_close(self):
+        """Handle window close."""
+        if self.running:
+            self._stop()
+        self.root.destroy()
 
-        self._root.destroy()
 
-
-
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-
-
-def main() -> None:
-
-    parser = argparse.ArgumentParser(description="Z-BOT Panoramic Heat Extraction GUI")
-
-    parser.add_argument("--rgb", type=int, default=0,
-
-                        help="RGB/webcam index (default: 0)")
-
-    parser.add_argument("--thermal", type=int, default=-1,
-
-                        help="Thermal/IR camera index (-1=none)")
-
-    parser.add_argument("--source", choices=["rgb", "thermal"], default="rgb",
-
-                        help="Heat source camera (default: rgb)")
-
-    parser.add_argument("--width", type=int, default=640)
-
-    parser.add_argument("--height", type=int, default=480)
-
-    parser.add_argument("--capture-fps", type=float, default=5.0,
-
-                        help="Stitch frames per second (default: 5.0)")
-
-    parser.add_argument("--thermal-minv", type=int, default=40)
-
-    parser.add_argument("--thermal-maxv", type=int, default=160)
-
-    parser.add_argument("--dx", type=int, default=0)
-
-    parser.add_argument("--dy", type=int, default=0)
-
+def main():
+    parser = argparse.ArgumentParser(description="Z-BOT Thermal Panorama (z-bot-map)")
+    parser.add_argument("--rgb", type=int, default=0, help="RGB camera index")
+    parser.add_argument("--thermal", type=int, default=-1, help="Thermal camera index (-1=none)")
+    parser.add_argument("--capture-fps", type=float, default=5.0, help="Stitch frames per second")
+    parser.add_argument("--source", choices=["rgb", "thermal"], default="rgb", help="Heat source")
+    
     args = parser.parse_args()
-
-
-
-    cfg = PanoramaConfig(
-
-        rgb_camera_idx=args.rgb,
-
-        thermal_camera_idx=args.thermal,
-
-        use_thermal_as_source=(args.source == "thermal"),
-
-        width=args.width,
-
-        height=args.height,
-
-        capture_fps=args.capture_fps,
-
-        thermal_minv=args.thermal_minv,
-
-        thermal_maxv=args.thermal_maxv,
-
-        rgb_thermal_dx=args.dx,
-
-        rgb_thermal_dy=args.dy,
-
-    )
-
-
-
+    
     root = tk.Tk()
-
-    app = PanoramaGUI(root, cfg)
-
-    if args.source == "thermal" and args.thermal >= 0:
-
-        app._source_var.set("thermal")
-
+    app = ThermalPanoramaGUI(root, args)
+    
+    if args.source == "thermal":
+        app.source_var.set("thermal")
+    
     root.mainloop()
 
 
-
-
-
 if __name__ == "__main__":
-
     main()
-
