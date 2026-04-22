@@ -156,6 +156,7 @@ class PanoramaConfig:
     use_ecc_fallback: bool = True  # z-bot-map ECC refinement
     blend_mode: str = "best"  # best, soft, or simple (z-bot-map integration)
     temporal_smoothing: float = 0.5  # Anti-Picasso: 0.0=instant switch, 0.5=heavy smooth
+    use_memory_canvas: bool = True  # z-bot-map memory approach: pixels stay fixed
     min_sharpness: float = 10.0  # Motion blur threshold (skip blurry frames)
     motion_quality_threshold: float = 0.0  # Skip frames below this quality
     canvas_padding_factor: int = 5
@@ -433,103 +434,54 @@ class CanvasManager:
                        angle_deg: float = 0.0,
                        gray_bgr: Optional[np.ndarray] = None,
                        frame_quality: float = 1.0) -> bool:
-        """Warp thermal frame onto canvas.
+        """Warp thermal frame onto canvas using MEMORY CANVAS approach.
         
-        Blend modes:
-        - best: z-bot-map detail-based selection (crisp edges)
-        - soft: weighted blend (smooth seams)
-        - simple: last-write-wins
+        CRITICAL (z-bot-map): Pixels stay FIXED at their canvas positions.
+        - New pixels: direct write
+        - Existing pixels: EMA blend (NO re-warping!)
+        
+        This prevents Picasso effect during camera movement.
         """
         ch, cw = self._canvas.shape
         H_c = self._H_offset @ H_acc
 
+        # Warp current frame to canvas coordinates
         warped = cv2.warpPerspective(
             gray.astype(np.float32), H_c, (cw, ch),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT, borderValue=0,
         )
-        new_data = warped > 0
-
-        if not new_data.any():
+        
+        # Create mask for valid warped pixels
+        mask = warped > 0
+        if not mask.any():
             return False
 
-        # First visit: write directly
-        first_visit = new_data & ~self._visited
-        self._canvas[first_visit] = warped[first_visit]
-        self._visited[first_visit] = True
+        # MEMORY CANVAS APPROACH (z-bot-map)
+        # 1. Identify new pixels (never seen before)
+        new_mask = mask & (self._visited == False)
         
-        if self._blend_mode == "best" and self._detail_score is not None:
-            # z-bot-map best blend: select best pixel based on detail + quality
-            self._blend_best(gray, gray_bgr, H_c, warped, new_data, frame_quality)
-        elif self._blend_mode == "soft":
-            # Soft blend: weighted average for smooth seams
-            revisit = new_data & self._visited & ~first_visit
-            if revisit.any():
-                self._canvas[revisit] = (0.7 * warped[revisit] +
-                                         0.3 * self._canvas[revisit])
-        # else: simple mode - first_visit already written, no overlap blend
-
-        return True
-    
-    def _blend_best(self, gray: np.ndarray, gray_bgr: Optional[np.ndarray],
-                    H_c: np.ndarray, warped: np.ndarray, 
-                    new_data: np.ndarray, frame_quality: float) -> None:
-        """z-bot-map best blend with memory canvas temporal smoothing.
+        # 2. Identify update pixels (already visited)
+        update_mask = mask & (self._visited == True)
         
-        Uses exponential moving average (EMA) approach from z-bot-map:
-        - First visit: direct write
-        - Revisit: blend old * (1-alpha) + new * alpha
-        """
-        ch, cw = self._canvas.shape
+        # 3. New pixels: direct write (first observation)
+        if new_mask.any():
+            self._canvas[new_mask] = warped[new_mask]
+            self._visited[new_mask] = True
         
-        # Compute detail score for this frame
-        if gray_bgr is not None:
-            detail_map = compute_detail_score_map(gray_bgr)
-        else:
-            # Fallback: use gradient magnitude on grayscale
-            gray_norm = (gray / gray.max() * 255).astype(np.uint8) if gray.max() > 0 else gray
-            gray_3ch = cv2.cvtColor(gray_norm, cv2.COLOR_GRAY2BGR)
-            detail_map = compute_detail_score_map(gray_3ch)
-        
-        # Feather weight (center > edges)
-        feather = compute_feather_weight((gray.shape[1], gray.shape[0]))
-        
-        # Combine detail + feather + quality
-        selection_score = detail_map * feather * frame_quality
-        
-        # Warp detail score
-        warped_score = cv2.warpPerspective(
-            selection_score.astype(np.float32), H_c, (cw, ch),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT, borderValue=0
-        )
-        
-        # Memory canvas approach (z-bot-map style)
-        revisit = new_data & self._visited
-        if not revisit.any():
-            return
-        
-        # Compute which pixels should be updated based on detail score
-        better_mask = warped_score[revisit] > self._detail_score[revisit]
-        
-        if self._temporal_smoothing > 0.0 and better_mask.any():
-            # EMA blending: old * (1-alpha) + new * alpha
-            revisit_idx = np.where(revisit)
-            better_idx = (revisit_idx[0][better_mask], revisit_idx[1][better_mask])
+        # 4. Existing pixels: EMA blend (temporal smoothing)
+        if update_mask.any() and self._temporal_smoothing > 0.0:
+            old_pixels = self._canvas[update_mask].astype(np.float32)
+            new_pixels = warped[update_mask].astype(np.float32)
             
-            old_pixels = self._canvas[better_idx].astype(np.float32)
-            new_pixels = warped[better_idx].astype(np.float32)
-            
-            # temporal_smoothing = alpha (weight of new observation)
+            # EMA: old * (1-alpha) + new * alpha
             blended = old_pixels * (1.0 - self._temporal_smoothing) + new_pixels * self._temporal_smoothing
-            self._canvas[better_idx] = np.clip(blended, 0, 255).astype(np.float32)
-            self._detail_score[better_idx] = warped_score[better_idx]
-        elif better_mask.any():
+            self._canvas[update_mask] = blended
+        elif update_mask.any():
             # No smoothing: direct replacement
-            revisit_idx = np.where(revisit)
-            better_idx = (revisit_idx[0][better_mask], revisit_idx[1][better_mask])
-            self._canvas[better_idx] = warped[better_idx]
-            self._detail_score[better_idx] = warped_score[better_idx]
+            self._canvas[update_mask] = warped[update_mask]
+        
+        return True
 
     def expand_if_needed(self, margin: int = 50) -> bool:
         """Expand canvas if content is within margin pixels of any edge.
