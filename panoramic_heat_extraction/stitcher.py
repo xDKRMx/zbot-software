@@ -531,25 +531,54 @@ class CanvasManager:
             self._canvas[better_idx] = warped[better_idx]
             self._detail_score[better_idx] = warped_score[better_idx]
 
-    def expand_if_needed(self, margin: int = 50) -> None:
-        """Expand canvas if content is within margin pixels of any edge."""
+    def expand_if_needed(self, margin: int = 50) -> bool:
+        """Expand canvas if content is within margin pixels of any edge.
+        
+        Returns True if expansion occurred, False otherwise.
+        Uses corner-based expansion from z-bot-map for precise growth.
+        """
         rows = np.any(self._visited, axis=1)
         cols = np.any(self._visited, axis=0)
         if not rows.any():
-            return
+            return False
+        
+        # Get current content bounds
         rmin, rmax = np.where(rows)[0][[0, -1]]
         cmin, cmax = np.where(cols)[0][[0, -1]]
         ch, cw = self._canvas.shape
-        if not (rmin < margin or rmax > ch - margin or
-                cmin < margin or cmax > cw - margin):
-            return
-        py, px = max(ch // 2, 200), max(cw // 2, 200)
-        self._canvas = np.pad(self._canvas, ((py, py), (px, px)), constant_values=0)
-        self._visited = np.pad(self._visited, ((py, py), (px, px)), constant_values=False)
-        self._ox += px
-        self._oy += py
+        
+        # Calculate needed expansion on each side
+        left = max(0, int(np.ceil(margin - cmin)))
+        top = max(0, int(np.ceil(margin - rmin)))
+        right = max(0, int(np.ceil(cmax + margin - cw)))
+        bottom = max(0, int(np.ceil(rmax + margin - ch)))
+        
+        if not any((left, top, right, bottom)):
+            return False
+        
+        # Expand only as needed (z-bot-map approach)
+        new_h = ch + top + bottom
+        new_w = cw + left + right
+        
+        expanded_canvas = np.zeros((new_h, new_w), dtype=np.float32)
+        expanded_visited = np.zeros((new_h, new_w), dtype=bool)
+        expanded_canvas[top:top + ch, left:left + cw] = self._canvas
+        expanded_visited[top:top + ch, left:left + cw] = self._visited
+        
+        self._canvas = expanded_canvas
+        self._visited = expanded_visited
+        self._ox += left
+        self._oy += top
         self._H_offset[0, 2] = self._ox
         self._H_offset[1, 2] = self._oy
+        
+        # Update detail score if using best blend
+        if self._detail_score is not None:
+            expanded_score = np.zeros((new_h, new_w), dtype=np.float32)
+            expanded_score[top:top + ch, left:left + cw] = self._detail_score
+            self._detail_score = expanded_score
+        
+        return True
 
     def get_cropped(self) -> np.ndarray:
         """Return canvas cropped to the visited bounding box."""
