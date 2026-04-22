@@ -121,6 +121,12 @@ class ThermalMapper:
             max_scale=self.args.max_scale,
             min_determinant=self.args.min_determinant,
             max_determinant=self.args.max_determinant,
+            # Flow tracking params (required by floor_video_map.py)
+            flow_max_points=300,
+            flow_min_distance=12.0,
+            flow_quality=0.01,
+            flow_error_threshold=20.0,
+            flow_backcheck_threshold=1.5,
         )
     
     def reset(self) -> None:
