@@ -22,7 +22,7 @@ except ImportError:
     print("[ERROR] Install Pillow: pip install Pillow")
     exit(1)
 
-from stitcher_zbot import ThermalMapper
+from stitcher import ThermalMapper
 
 # GUI Constants
 PANEL_W = 480
