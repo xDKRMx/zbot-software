@@ -380,19 +380,29 @@ class ThermalMapper:
         return color
     
     def get_thermal_heatmap(self) -> np.ndarray:
-        """Get thermal heatmap (JET colormap)."""
+        """Get thermal heatmap — auto-scale + JET colormap (lepton_fixed_scale style)."""
         if not self.valid_mask_thermal.any():
             return np.zeros((self.args.canvas_height, self.args.canvas_width, 3), dtype=np.uint8)
-        
+
         valid = self.canvas_thermal >= 1.0
-        denom = max(self._thermal_maxv - self._thermal_minv, 1)
-        stretched = ((np.clip(self.canvas_thermal, self._thermal_minv, self._thermal_maxv) - self._thermal_minv)
-                     * (255.0 / denom)).astype(np.uint8)
-        stretched = cv2.GaussianBlur(stretched, (7, 7), 2)
+
+        # Auto-scale: stretch actual data range to 0-255 for maximum contrast
+        # Same principle as lepton_fixed_scale.py but adapted for 8-bit UVC output
+        data = self.canvas_thermal[valid]
+        if data.size == 0:
+            return np.zeros((self.args.canvas_height, self.args.canvas_width, 3), dtype=np.uint8)
+
+        min_val = float(data.min())
+        max_val = float(data.max())
+        denom = max(max_val - min_val, 1.0)
+
+        stretched = np.clip(self.canvas_thermal - min_val, 0, denom)
+        stretched = ((stretched / denom) * 255.0).astype(np.uint8)
         stretched[~valid] = 0
+
         colored = cv2.applyColorMap(stretched, cv2.COLORMAP_JET)
         colored[~valid] = [0, 0, 0]
-        
+
         # Crop to valid region
         if np.any(self.valid_mask_thermal):
             colored_cropped, _, _ = crop_to_valid_region(colored, self.valid_mask_thermal)

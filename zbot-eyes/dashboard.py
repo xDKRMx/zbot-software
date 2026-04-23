@@ -521,22 +521,28 @@ class ZBotDashboard:
                             (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
                 # ── Build thermal display ─────────────────────────────────────
+                # Replicate lepton_fixed_scale.py: clip to range, stretch, JET colormap
+                # Since VideoCapture gives uint8 (UVC driver converts from uint16),
+                # we auto-scale the actual frame range for maximum contrast
                 if frame_thermal is not None:
-                    # Lepton fixed scale: same as run_thermal.py process_thermal_frame
-                    # Auto-stretch the actual frame range → full 0-255 → COLORMAP_JET
                     gray_t = cv2.cvtColor(frame_thermal, cv2.COLOR_BGR2GRAY)
+                    # Use center ROI to find actual data range (avoid black borders)
                     h_t, w_t = gray_t.shape
                     roi = gray_t[int(h_t*0.05):int(h_t*0.90),
                                  int(w_t*0.05):int(w_t*0.95)]
                     min_val = int(roi.min())
                     max_val = int(roi.max())
                     denom = max(max_val - min_val, 1)
+                    # Clip + stretch → 0-255 (exact lepton_fixed_scale.py logic)
                     x = np.clip(gray_t.astype(np.int32) - min_val, 0, denom)
                     x = ((x * 255.0) / denom).astype(np.uint8)
                     disp_thermal = cv2.applyColorMap(x, cv2.COLORMAP_JET)
                 else:
                     gray = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2GRAY)
-                    disp_thermal = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+                    min_v, max_v = int(gray.min()), int(gray.max())
+                    x = np.clip(gray.astype(np.int32) - min_v, 0, max(max_v - min_v, 1))
+                    x = ((x * 255.0) / max(max_v - min_v, 1)).astype(np.uint8)
+                    disp_thermal = cv2.applyColorMap(x, cv2.COLORMAP_JET)
                 if hotspot and np.count_nonzero(heat_mask) > 0:
                     ov = np.zeros_like(disp_thermal)
                     ov[heat_mask > 0] = [255, 0, 255]
