@@ -72,8 +72,8 @@ C_SUBTEXT  = "#6b21a8"   # dim purple text
 C_BAR      = "#0d0015"   # top/status bar — darkest purple
 C_GLOW     = "#7c3aed"   # purple glow for borders
 
-PANEL_W, PANEL_H = 400, 300
-WIN_W, WIN_H = 1280, 820
+PANEL_W, PANEL_H = 480, 360
+WIN_W, WIN_H = 1520, 920
 UPDATE_MS = 100
 
 
@@ -378,7 +378,7 @@ class ZBotDashboard:
         self._orchestrator = UnifiedOrchestrator(
             config=self._config,
             glm_interval_s=self._args.glm_interval,
-            enable_audio_output=False,
+            enable_audio_output=True,
         )
         self._orchestrator.start()
 
