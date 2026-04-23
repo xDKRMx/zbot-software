@@ -58,9 +58,21 @@ except Exception as _e:
     print(f"[DASHBOARD] ThermalMapper unavailable: {_e}")
     _MAPPER_AVAILABLE = False
 
-# ── Layout ────────────────────────────────────────────────────────────────────
+# ── Colors (neon AI theme) ────────────────────────────────────────────────────
+C_BG       = "#0a0a0f"   # near-black background
+C_PANEL    = "#0d0d1a"   # panel background
+C_BORDER   = "#1a1a2e"   # subtle border
+C_ACCENT1  = "#00d4ff"   # cyan neon — titles
+C_ACCENT2  = "#ff006e"   # hot pink — alerts
+C_ACCENT3  = "#7c3aed"   # purple — GLM
+C_GREEN    = "#00ff88"   # neon green — OK states
+C_YELLOW   = "#ffd60a"   # yellow — warnings
+C_TEXT     = "#e0e0ff"   # light blue-white text
+C_SUBTEXT  = "#6060a0"   # dim text
+C_BAR      = "#111128"   # top/status bar
+
 PANEL_W, PANEL_H = 400, 300
-WIN_W, WIN_H = 1280, 760
+WIN_W, WIN_H = 1280, 820
 UPDATE_MS = 100
 
 
@@ -127,7 +139,7 @@ class ZBotDashboard:
         self._cooldown_s = 3.0
 
         self._root.title("Z-BOT Exhibition Dashboard — Challenge Cup")
-        self._root.configure(bg="#1e1e2e")
+        self._root.configure(bg=C_BG)
         self._root.resizable(False, False)
         self._root.geometry(f"{WIN_W}x{WIN_H}")
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -137,121 +149,165 @@ class ZBotDashboard:
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        # Top bar
-        top = tk.Frame(self._root, bg="#313244", pady=5)
+        from tkinter import ttk
+
+        # ── Top bar ───────────────────────────────────────────────────────────
+        top = tk.Frame(self._root, bg=C_BAR, pady=6)
         top.pack(fill="x")
-        tk.Label(top, text="Z-BOT  Exhibition Dashboard",
-                 font=("Helvetica", 13, "bold"),
-                 bg="#313244", fg="#cdd6f4").pack(side="left", padx=12)
 
-        self._btn_start = tk.Button(
-            top, text="▶ Start", width=9,
-            bg="#a6e3a1", fg="#1e1e2e", font=("Helvetica", 9, "bold"),
-            relief="flat", cursor="hand2", command=self._toggle)
-        self._btn_start.pack(side="right", padx=4)
+        # Neon title
+        title_f = tk.Frame(top, bg=C_BAR)
+        title_f.pack(side="left", padx=12)
+        tk.Label(title_f, text="⬡ Z-BOT",
+                 font=("Courier", 14, "bold"),
+                 bg=C_BAR, fg=C_ACCENT1).pack(side="left")
+        tk.Label(title_f, text="  EXHIBITION DASHBOARD",
+                 font=("Courier", 11),
+                 bg=C_BAR, fg=C_TEXT).pack(side="left")
+        tk.Label(title_f, text="  ◈ CHALLENGE CUP",
+                 font=("Courier", 9),
+                 bg=C_BAR, fg=C_SUBTEXT).pack(side="left")
 
-        tk.Button(top, text="💾 Export", width=9,
-                  bg="#89b4fa", fg="#1e1e2e", font=("Helvetica", 9, "bold"),
-                  relief="flat", cursor="hand2", command=self._export
-                  ).pack(side="right", padx=4)
+        # Buttons
+        for txt, bg, cmd in [
+            ("▶ START", C_GREEN, self._toggle),
+            ("💾 EXPORT", C_ACCENT1, self._export),
+            ("↺ RESET", C_ACCENT2, self._reset),
+        ]:
+            b = tk.Button(top, text=txt, width=10,
+                          bg=bg, fg=C_BG,
+                          font=("Courier", 9, "bold"),
+                          relief="flat", cursor="hand2",
+                          activebackground=bg, activeforeground=C_BG,
+                          command=cmd)
+            b.pack(side="right", padx=3)
+            if txt == "▶ START":
+                self._btn_start = b
 
-        tk.Button(top, text="🔄 Reset", width=9,
-                  bg="#f38ba8", fg="#1e1e2e", font=("Helvetica", 9, "bold"),
-                  relief="flat", cursor="hand2", command=self._reset
-                  ).pack(side="right", padx=4)
+        # Camera source indicator
+        src_f = tk.Frame(top, bg=C_BAR)
+        src_f.pack(side="right", padx=16)
+        tk.Label(src_f, text="RGB→WALL", bg=C_BAR,
+                 fg=C_GREEN, font=("Courier", 8)).pack(side="left", padx=4)
+        tk.Label(src_f, text="IR→HEAT+MAP", bg=C_BAR,
+                 fg=C_ACCENT2, font=("Courier", 8)).pack(side="left", padx=4)
 
-        # Top panels row
-        top_row = tk.Frame(self._root, bg="#1e1e2e")
-        top_row.pack(pady=(6, 0))
+        # ── Top panels row ────────────────────────────────────────────────────
+        top_row = tk.Frame(self._root, bg=C_BG)
+        top_row.pack(pady=(4, 0))
 
-        panels = [
-            ("RGB + Wall/Net Detection", "rgb"),
-            ("Thermal + Heat Detection", "thermal"),
-            ("Thermal Heat Map Panorama", "heatmap"),
+        panel_defs = [
+            ("◈ RGB  ·  WALL / NET DETECTION", "rgb", C_GREEN),
+            ("◈ THERMAL  ·  HEAT DETECTION", "thermal", C_ACCENT2),
+            ("◈ THERMAL HEAT MAP  ·  PANORAMA", "heatmap", C_ACCENT1),
         ]
         self._panel_labels: dict[str, tk.Label] = {}
-        for title, key in panels:
-            f = tk.Frame(top_row, bg="#1e1e2e")
-            f.pack(side="left", padx=4)
-            tk.Label(f, text=title, bg="#1e1e2e", fg="#89b4fa",
-                     font=("Helvetica", 9, "bold")).pack(anchor="w")
-            lbl = tk.Label(f, bg="#11111b", width=PANEL_W, height=PANEL_H)
+        for title, key, color in panel_defs:
+            f = tk.Frame(top_row, bg=C_BG, padx=3)
+            f.pack(side="left")
+            # Neon title bar
+            title_bar = tk.Frame(f, bg=C_PANEL, pady=2)
+            title_bar.pack(fill="x")
+            tk.Label(title_bar, text=title, bg=C_PANEL, fg=color,
+                     font=("Courier", 8, "bold")).pack(side="left", padx=6)
+            # Panel with neon border effect
+            border = tk.Frame(f, bg=color, padx=1, pady=1)
+            border.pack()
+            lbl = tk.Label(border, bg=C_PANEL, width=PANEL_W, height=PANEL_H)
             lbl.pack()
             self._panel_labels[key] = lbl
-            self._show_placeholder(lbl, "Press ▶ Start")
+            self._show_placeholder(lbl, "PRESS  ▶ START")
 
-        # Bottom row — tabbed notebook
-        from tkinter import ttk
-        bot_nb = ttk.Notebook(self._root)
-        bot_nb.pack(fill="x", padx=4, pady=(6, 0))
+        # ── Bottom section ────────────────────────────────────────────────────
+        bot = tk.Frame(self._root, bg=C_BG)
+        bot.pack(fill="both", expand=True, padx=4, pady=(4, 0))
 
-        # Tab 1: Detection Log + GLM
-        tab_main = tk.Frame(bot_nb, bg="#1e1e2e")
-        bot_nb.add(tab_main, text="  📋 Detection Log & AI  ")
+        # Left column: Log (top) + GLM (bottom)
+        left_col = tk.Frame(bot, bg=C_BG)
+        left_col.pack(side="left", fill="both", expand=True, padx=(0, 4))
 
-        log_f = tk.Frame(tab_main, bg="#1e1e2e")
-        log_f.pack(side="left", fill="both", expand=True, padx=(0, 4))
-        tk.Label(log_f, text="Detection Log", bg="#1e1e2e",
-                 fg="#a6adc8", font=("Helvetica", 9, "bold")).pack(anchor="w")
+        # Detection Log
+        log_hdr = tk.Frame(left_col, bg=C_PANEL, pady=2)
+        log_hdr.pack(fill="x")
+        tk.Label(log_hdr, text="◈ DETECTION LOG", bg=C_PANEL,
+                 fg=C_GREEN, font=("Courier", 8, "bold")).pack(side="left", padx=6)
         self._log_text = tk.Text(
-            log_f, height=8, bg="#11111b", fg="#a6e3a1",
-            font=("Courier", 8), state="disabled", wrap="word")
+            left_col, height=5, bg=C_PANEL, fg=C_GREEN,
+            font=("Courier", 8), state="disabled", wrap="word",
+            insertbackground=C_GREEN, selectbackground=C_ACCENT3)
         self._log_text.pack(fill="both", expand=True)
 
-        glm_f = tk.Frame(tab_main, bg="#1e1e2e")
-        glm_f.pack(side="left", fill="both", expand=True)
-        tk.Label(glm_f, text="🤖 Z-BOT AI Commentary (GLM)", bg="#1e1e2e",
-                 fg="#f38ba8", font=("Helvetica", 9, "bold")).pack(anchor="w")
+        # GLM Commentary
+        glm_hdr = tk.Frame(left_col, bg=C_PANEL, pady=2)
+        glm_hdr.pack(fill="x", pady=(3, 0))
+        tk.Label(glm_hdr, text="◈ Z-BOT AI  ·  GLM COMMENTARY", bg=C_PANEL,
+                 fg=C_ACCENT3, font=("Courier", 8, "bold")).pack(side="left", padx=6)
         self._glm_text = tk.Text(
-            glm_f, height=8, bg="#11111b", fg="#cdd6f4",
-            font=("Helvetica", 9), state="disabled", wrap="word")
+            left_col, height=5, bg=C_PANEL, fg=C_TEXT,
+            font=("Helvetica", 9), state="disabled", wrap="word",
+            insertbackground=C_ACCENT3, selectbackground=C_ACCENT3)
         self._glm_text.pack(fill="both", expand=True)
 
-        # Tab 2: Heat Sources
-        tab_heat = tk.Frame(bot_nb, bg="#1e1e2e")
-        bot_nb.add(tab_heat, text="  🔴 Heat Sources  ")
+        # Right column: Heat Sources table
+        right_col = tk.Frame(bot, bg=C_BG, width=480)
+        right_col.pack(side="left", fill="both")
+        right_col.pack_propagate(False)
 
-        # Summary row
-        heat_top = tk.Frame(tab_heat, bg="#1e1e2e")
-        heat_top.pack(fill="x", padx=4, pady=2)
-        self._heat_summary_var = tk.StringVar(value="No heat sources detected yet")
-        tk.Label(heat_top, textvariable=self._heat_summary_var,
-                 bg="#1e1e2e", fg="#f38ba8",
-                 font=("Helvetica", 9, "bold")).pack(side="left")
+        heat_hdr = tk.Frame(right_col, bg=C_PANEL, pady=2)
+        heat_hdr.pack(fill="x")
+        tk.Label(heat_hdr, text="◈ HEAT SOURCES  ·  DETECTED POSITIONS",
+                 bg=C_PANEL, fg=C_ACCENT2,
+                 font=("Courier", 8, "bold")).pack(side="left", padx=6)
+        self._heat_summary_var = tk.StringVar(value="No heat sources yet")
+        tk.Label(heat_hdr, textvariable=self._heat_summary_var,
+                 bg=C_PANEL, fg=C_YELLOW,
+                 font=("Courier", 7)).pack(side="right", padx=6)
 
-        # Heat sources table
-        cols = ("ID", "Time", "Pixel X", "Pixel Y", "Area (px²)", "Confidence", "Canvas X", "Canvas Y")
-        self._heat_tree = ttk.Treeview(tab_heat, columns=cols, show="headings", height=6)
-        col_widths = [40, 80, 70, 70, 80, 80, 70, 70]
+        cols = ("ID", "Time", "Px X", "Px Y", "Area", "Conf")
+        self._heat_tree = ttk.Treeview(right_col, columns=cols,
+                                       show="headings", height=9)
+        col_widths = [35, 65, 55, 55, 65, 50]
         for col, w in zip(cols, col_widths):
             self._heat_tree.heading(col, text=col)
             self._heat_tree.column(col, width=w, anchor="center")
-        self._heat_tree.pack(fill="both", expand=True, padx=4, pady=2)
+        self._heat_tree.pack(fill="both", expand=True)
 
-        # Style the treeview
         style = ttk.Style()
-        style.configure("Treeview", background="#11111b", foreground="#cdd6f4",
-                         fieldbackground="#11111b", rowheight=20)
-        style.configure("Treeview.Heading", background="#313244", foreground="#89b4fa")
+        style.theme_use("default")
+        style.configure("Treeview",
+                         background=C_PANEL, foreground=C_TEXT,
+                         fieldbackground=C_PANEL, rowheight=18,
+                         font=("Courier", 8))
+        style.configure("Treeview.Heading",
+                         background=C_BORDER, foreground=C_ACCENT1,
+                         font=("Courier", 8, "bold"))
+        style.map("Treeview", background=[("selected", C_ACCENT3)])
 
-        # Status bar
-        sb = tk.Frame(self._root, bg="#313244", pady=3)
+        # ── Status bar ────────────────────────────────────────────────────────
+        sb = tk.Frame(self._root, bg=C_BAR, pady=3)
         sb.pack(fill="x", side="bottom")
-        self._status_var = tk.StringVar(value="Ready — press Start")
+
+        # Animated state indicator
+        self._state_dot = tk.Label(sb, text="●", bg=C_BAR,
+                                   fg=C_SUBTEXT, font=("Courier", 10))
+        self._state_dot.pack(side="left", padx=(8, 2))
+
+        self._status_var = tk.StringVar(value="READY  ·  PRESS START")
         tk.Label(sb, textvariable=self._status_var,
-                 bg="#313244", fg="#a6adc8",
-                 font=("Helvetica", 9), anchor="w").pack(side="left", padx=10)
+                 bg=C_BAR, fg=C_TEXT,
+                 font=("Courier", 9), anchor="w").pack(side="left")
+
         self._stats_var = tk.StringVar(value="")
         tk.Label(sb, textvariable=self._stats_var,
-                 bg="#313244", fg="#a6e3a1",
-                 font=("Helvetica", 9), anchor="e").pack(side="right", padx=10)
+                 bg=C_BAR, fg=C_SUBTEXT,
+                 font=("Courier", 8), anchor="e").pack(side="right", padx=10)
 
     def _show_placeholder(self, label: tk.Label, text: str) -> None:
         img = np.zeros((PANEL_H, PANEL_W, 3), dtype=np.uint8)
-        img[:] = (17, 17, 27)
-        tw, th = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0]
+        img[:] = (13, 13, 26)  # C_PANEL
+        tw, th = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
         cv2.putText(img, text, ((PANEL_W - tw) // 2, (PANEL_H + th) // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (88, 91, 112), 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 100), 1)
         self._put_image(label, img)
 
     def _put_image(self, label: tk.Label, img_bgr: np.ndarray) -> None:
@@ -260,7 +316,7 @@ class ZBotDashboard:
         nw, nh = int(w * scale), int(h * scale)
         resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
         canvas = np.zeros((PANEL_H, PANEL_W, 3), dtype=np.uint8)
-        canvas[:] = (17, 17, 27)
+        canvas[:] = (13, 13, 26)
         y0, x0 = (PANEL_H - nh) // 2, (PANEL_W - nw) // 2
         canvas[y0:y0+nh, x0:x0+nw] = resized
         pil = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
@@ -279,25 +335,34 @@ class ZBotDashboard:
     def _start(self) -> None:
         self._stop_evt.clear()
 
-        # Open RGB camera
+        # Open RGB camera (webcam → wall/net detection)
         idx = self._args.rgb
-        self._cap_rgb = (cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                         if sys.platform == "win32"
-                         else cv2.VideoCapture(idx))
+        if sys.platform == "win32":
+            self._cap_rgb = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        else:
+            # Try /dev/videoX path first (better for PureThermal/UVC on Linux)
+            self._cap_rgb = cv2.VideoCapture(f"/dev/video{idx}")
+            if not self._cap_rgb.isOpened():
+                self._cap_rgb = cv2.VideoCapture(idx)
         if not self._cap_rgb.isOpened():
             messagebox.showerror("Camera Error", f"Cannot open RGB camera {idx}")
             return
 
-        # Open thermal camera
+        # Open thermal/IR camera (→ heat detection + heat map panorama)
         self._cap_thermal = None
         tidx = self._args.thermal
         if tidx >= 0:
-            self._cap_thermal = (cv2.VideoCapture(tidx, cv2.CAP_DSHOW)
-                                 if sys.platform == "win32"
-                                 else cv2.VideoCapture(tidx))
+            if sys.platform == "win32":
+                self._cap_thermal = cv2.VideoCapture(tidx, cv2.CAP_DSHOW)
+            else:
+                self._cap_thermal = cv2.VideoCapture(f"/dev/video{tidx}")
+                if not self._cap_thermal.isOpened():
+                    self._cap_thermal = cv2.VideoCapture(tidx)
             if not self._cap_thermal.isOpened():
                 self._cap_thermal = None
-                self._log("⚠ Thermal camera unavailable, using RGB fallback")
+                self._log("⚠ Thermal/IR camera unavailable — using RGB fallback for heat")
+            else:
+                self._log(f"✓ Thermal/IR camera {tidx} opened")
 
         # Create thermal mapper
         if _MAPPER_AVAILABLE:
@@ -321,8 +386,8 @@ class ZBotDashboard:
             target=self._detection_loop, daemon=True)
         self._det_thread.start()
 
-        self._btn_start.config(text="⏹ Stop", bg="#f38ba8")
-        self._status_var.set("Running — Z-BOT systems active")
+        self._btn_start.config(text="⏹ STOP", bg=C_ACCENT2)
+        self._status_var.set("RUNNING  ·  Z-BOT SYSTEMS ACTIVE")
         self._root.after(UPDATE_MS, self._refresh_loop)
 
     def _stop(self) -> None:
@@ -338,8 +403,8 @@ class ZBotDashboard:
         if self._cap_thermal:
             self._cap_thermal.release()
             self._cap_thermal = None
-        self._btn_start.config(text="▶ Start", bg="#a6e3a1")
-        self._status_var.set("Stopped")
+        self._btn_start.config(text="▶ START", bg=C_GREEN)
+        self._status_var.set("STOPPED")
 
     def _reset(self) -> None:
         self._stop()
@@ -353,7 +418,7 @@ class ZBotDashboard:
         for row in self._heat_tree.get_children():
             self._heat_tree.delete(row)
         self._heat_summary_var.set("No heat sources detected yet")
-        self._status_var.set("Reset — press Start")
+        self._status_var.set("RESET  ·  PRESS START")
         self._stats_var.set("")
 
     def _export(self) -> None:
@@ -650,16 +715,20 @@ class ZBotDashboard:
                 if md:
                     self._append_text(self._glm_text, f"🤖 Z-BOT:\n{md}\n{'─'*40}")
 
-        # Status bar
-        state_icons = {"NET": "🟢 NET DETECTED", "WALL": "⬜ WALL",
-                       "HOTSPOT": "🔴 HOTSPOT ALERT"}
-        state_text = state_icons.get(s.system_state, s.system_state)
+        # Status bar with neon state indicator
+        state_map = {
+            "NET":     ("🟢 NET DETECTED",    C_GREEN),
+            "WALL":    ("⬜ WALL",             C_SUBTEXT),
+            "HOTSPOT": ("🔴 HOTSPOT ALERT",   C_ACCENT2),
+        }
+        state_text, state_color = state_map.get(s.system_state, (s.system_state, C_TEXT))
         if s.error:
-            state_text = f"⚠ ERROR: {s.error[:60]}"
+            state_text, state_color = f"⚠ {s.error[:60]}", C_YELLOW
         self._status_var.set(state_text)
+        self._state_dot.config(fg=state_color)
         self._stats_var.set(
-            f"Stitched: {s.stitched}  |  Tracked: {s.tracked}  |  "
-            f"Rejected: {s.rejected}  |  {s.mapper_status[:40]}"
+            f"Stitched:{s.stitched}  Tracked:{s.tracked}  "
+            f"Rejected:{s.rejected}  ·  {s.mapper_status[:50]}"
         )
 
         self._root.after(UPDATE_MS, self._refresh_loop)
@@ -676,18 +745,15 @@ class ZBotDashboard:
         for row in self._heat_tree.get_children():
             self._heat_tree.delete(row)
         for src in s.heat_sources[-50:]:
-            canvas_x = str(src.canvas_x) if src.canvas_x is not None else "—"
-            canvas_y = str(src.canvas_y) if src.canvas_y is not None else "—"
             tag = "active" if src.expires_at > time.time() else "old"
             self._heat_tree.insert("", "end", values=(
                 src.id, src.timestamp,
                 src.pixel_x, src.pixel_y,
                 src.area_px,
                 f"{src.confidence:.2f}",
-                canvas_x, canvas_y,
             ), tags=(tag,))
-        self._heat_tree.tag_configure("active", foreground="#f38ba8")
-        self._heat_tree.tag_configure("old", foreground="#585b70")
+        self._heat_tree.tag_configure("active", foreground="#ff006e")
+        self._heat_tree.tag_configure("old", foreground="#6060a0")
         # Scroll to bottom
         children = self._heat_tree.get_children()
         if children:
