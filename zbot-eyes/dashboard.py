@@ -348,6 +348,9 @@ class ZBotDashboard:
         if not self._cap_rgb.isOpened():
             messagebox.showerror("Camera Error", f"Cannot open RGB camera {idx}")
             return
+        # Match thermal camera resolution (160×120) for consistent processing
+        self._cap_rgb.set(cv2.CAP_PROP_FRAME_WIDTH, 160)
+        self._cap_rgb.set(cv2.CAP_PROP_FRAME_HEIGHT, 120)
 
         # Open thermal/IR camera (→ heat detection + heat map panorama)
         self._cap_thermal = None
