@@ -521,10 +521,21 @@ class ZBotDashboard:
 
                 # ── Build thermal display ─────────────────────────────────────
                 if frame_thermal is not None:
-                    disp_thermal = frame_thermal.copy()
+                    # Apply PureThermal MINV/MAXV normalization + JET colormap
+                    # (matches run_thermal.py process_thermal_frame logic)
+                    gray_t = cv2.cvtColor(frame_thermal, cv2.COLOR_BGR2GRAY)
+                    h_t, w_t = gray_t.shape
+                    roi = gray_t[int(h_t*0.05):int(h_t*0.90), int(w_t*0.05):int(w_t*0.95)]
+                    min_val, max_val, _, _ = cv2.minMaxLoc(roi)
+                    MINV, MAXV = 40, 160
+                    x = np.clip(gray_t, MINV, MAXV)
+                    x = ((x - MINV) * (255.0 / (MAXV - MINV))).astype(np.uint8)
+                    disp_thermal = cv2.applyColorMap(x, cv2.COLORMAP_JET)
                 else:
                     gray = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2GRAY)
-                    disp_thermal = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+                    x = np.clip(gray, 40, 160)
+                    x = ((x - 40) * (255.0 / 120)).astype(np.uint8)
+                    disp_thermal = cv2.applyColorMap(x, cv2.COLORMAP_JET)
                 if hotspot and np.count_nonzero(heat_mask) > 0:
                     ov = np.zeros_like(disp_thermal)
                     ov[heat_mask > 0] = [255, 0, 255]
@@ -575,9 +586,11 @@ class ZBotDashboard:
                     last_thermal_ts = now
                     if not self._thermal_processing:
                         self._thermal_processing = True
-                        thermal_gray = (cv2.cvtColor(frame_thermal, cv2.COLOR_BGR2GRAY)
-                                        if frame_thermal is not None
-                                        else cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2GRAY))
+                        # Use raw grayscale for mapper (before colormap)
+                        if frame_thermal is not None:
+                            thermal_gray = cv2.cvtColor(frame_thermal, cv2.COLOR_BGR2GRAY)
+                        else:
+                            thermal_gray = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2GRAY)
                         threading.Thread(
                             target=self._thermal_worker,
                             args=(frame_rgb.copy(), thermal_gray, now),
@@ -771,10 +784,10 @@ class ZBotDashboard:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Z-BOT Exhibition Dashboard")
-    parser.add_argument("--rgb", type=int, default=0,
-                        help="RGB camera index (default: 0)")
-    parser.add_argument("--thermal", type=int, default=-1,
-                        help="Thermal/IR camera index (-1=none)")
+    parser.add_argument("--rgb", type=int, default=1,
+                        help="RGB/webcam camera index (default: 1)")
+    parser.add_argument("--thermal", type=int, default=0,
+                        help="Thermal/IR camera index (-1=none, default: 0)")
     parser.add_argument("--fps", type=float, default=5.0,
                         help="Detection FPS (default: 5.0)")
     parser.add_argument("--thermal-fps", type=float, default=3.0,
