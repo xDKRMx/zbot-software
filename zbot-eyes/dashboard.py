@@ -198,9 +198,9 @@ class ZBotDashboard:
         top_row.pack(pady=(4, 0))
 
         panel_defs = [
-            ("◈ RGB  ·  WALL / NET DETECTION", "rgb", C_GREEN),
-            ("◈ THERMAL  ·  HEAT DETECTION", "thermal", C_ACCENT2),
-            ("◈ THERMAL HEAT MAP  ·  PANORAMA", "heatmap", C_ACCENT1),
+            ("◈ RGB  ·  WALL / NET DETECTION",    "rgb",     "#4ade80"),  # green
+            ("◈ THERMAL  ·  HEAT DETECTION",       "thermal", "#f472b6"),  # pink
+            ("◈ THERMAL HEAT MAP  ·  PANORAMA",    "heatmap", "#a855f7"),  # purple
         ]
         self._panel_labels: dict[str, tk.Label] = {}
         for title, key, color in panel_defs:
@@ -211,8 +211,8 @@ class ZBotDashboard:
             title_bar.pack(fill="x")
             tk.Label(title_bar, text=title, bg=C_PANEL, fg=color,
                      font=("Courier", 8, "bold")).pack(side="left", padx=6)
-            # Panel with purple glow border effect
-            border = tk.Frame(f, bg=C_GLOW, padx=1, pady=1)
+            # Panel with its own color border
+            border = tk.Frame(f, bg=color, padx=1, pady=1)
             border.pack()
             lbl = tk.Label(border, bg=C_PANEL, width=PANEL_W, height=PANEL_H)
             lbl.pack()
@@ -522,23 +522,21 @@ class ZBotDashboard:
 
                 # ── Build thermal display ─────────────────────────────────────
                 if frame_thermal is not None:
-                    # Auto-scale normalization: stretch actual frame min/max to 0-255
-                    # This gives maximum contrast regardless of scene temperature range
+                    # Lepton fixed scale: same as run_thermal.py process_thermal_frame
+                    # Auto-stretch the actual frame range → full 0-255 → COLORMAP_JET
                     gray_t = cv2.cvtColor(frame_thermal, cv2.COLOR_BGR2GRAY)
-                    # Use center ROI to avoid black borders/UI overlays
                     h_t, w_t = gray_t.shape
                     roi = gray_t[int(h_t*0.05):int(h_t*0.90),
                                  int(w_t*0.05):int(w_t*0.95)]
                     min_val = int(roi.min())
                     max_val = int(roi.max())
                     denom = max(max_val - min_val, 1)
-                    # Stretch to full 0-255 range
                     x = np.clip(gray_t.astype(np.int32) - min_val, 0, denom)
                     x = ((x * 255.0) / denom).astype(np.uint8)
-                    disp_thermal = cv2.applyColorMap(x, cv2.COLORMAP_INFERNO)
+                    disp_thermal = cv2.applyColorMap(x, cv2.COLORMAP_JET)
                 else:
                     gray = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2GRAY)
-                    disp_thermal = cv2.applyColorMap(gray, cv2.COLORMAP_INFERNO)
+                    disp_thermal = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
                 if hotspot and np.count_nonzero(heat_mask) > 0:
                     ov = np.zeros_like(disp_thermal)
                     ov[heat_mask > 0] = [255, 0, 255]
