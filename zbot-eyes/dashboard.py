@@ -58,18 +58,19 @@ except Exception as _e:
     print(f"[DASHBOARD] ThermalMapper unavailable: {_e}")
     _MAPPER_AVAILABLE = False
 
-# ── Colors (neon AI theme) ────────────────────────────────────────────────────
-C_BG       = "#0a0a0f"   # near-black background
-C_PANEL    = "#0d0d1a"   # panel background
-C_BORDER   = "#1a1a2e"   # subtle border
-C_ACCENT1  = "#00d4ff"   # cyan neon — titles
-C_ACCENT2  = "#ff006e"   # hot pink — alerts
-C_ACCENT3  = "#7c3aed"   # purple — GLM
-C_GREEN    = "#00ff88"   # neon green — OK states
-C_YELLOW   = "#ffd60a"   # yellow — warnings
-C_TEXT     = "#e0e0ff"   # light blue-white text
-C_SUBTEXT  = "#6060a0"   # dim text
-C_BAR      = "#111128"   # top/status bar
+# ── Colors (dark purple/violet AI theme) ─────────────────────────────────────
+C_BG       = "#0a0008"   # near-black with purple tint
+C_PANEL    = "#0f000d"   # panel background — deep purple-black
+C_BORDER   = "#3d0050"   # purple border
+C_ACCENT1  = "#c084fc"   # soft purple — titles (like reference)
+C_ACCENT2  = "#f472b6"   # pink — alerts/thermal
+C_ACCENT3  = "#a855f7"   # vivid purple — GLM
+C_GREEN    = "#4ade80"   # soft green — OK states
+C_YELLOW   = "#fbbf24"   # amber — warnings
+C_TEXT     = "#e9d5ff"   # light lavender text
+C_SUBTEXT  = "#6b21a8"   # dim purple text
+C_BAR      = "#0d0015"   # top/status bar — darkest purple
+C_GLOW     = "#7c3aed"   # purple glow for borders
 
 PANEL_W, PANEL_H = 400, 300
 WIN_W, WIN_H = 1280, 820
@@ -210,8 +211,8 @@ class ZBotDashboard:
             title_bar.pack(fill="x")
             tk.Label(title_bar, text=title, bg=C_PANEL, fg=color,
                      font=("Courier", 8, "bold")).pack(side="left", padx=6)
-            # Panel with neon border effect
-            border = tk.Frame(f, bg=color, padx=1, pady=1)
+            # Panel with purple glow border effect
+            border = tk.Frame(f, bg=C_GLOW, padx=1, pady=1)
             border.pack()
             lbl = tk.Label(border, bg=C_PANEL, width=PANEL_W, height=PANEL_H)
             lbl.pack()
@@ -521,21 +522,23 @@ class ZBotDashboard:
 
                 # ── Build thermal display ─────────────────────────────────────
                 if frame_thermal is not None:
-                    # Apply PureThermal MINV/MAXV normalization + JET colormap
-                    # (matches run_thermal.py process_thermal_frame logic)
+                    # Auto-scale normalization: stretch actual frame min/max to 0-255
+                    # This gives maximum contrast regardless of scene temperature range
                     gray_t = cv2.cvtColor(frame_thermal, cv2.COLOR_BGR2GRAY)
+                    # Use center ROI to avoid black borders/UI overlays
                     h_t, w_t = gray_t.shape
-                    roi = gray_t[int(h_t*0.05):int(h_t*0.90), int(w_t*0.05):int(w_t*0.95)]
-                    min_val, max_val, _, _ = cv2.minMaxLoc(roi)
-                    MINV, MAXV = 40, 160
-                    x = np.clip(gray_t, MINV, MAXV)
-                    x = ((x - MINV) * (255.0 / (MAXV - MINV))).astype(np.uint8)
-                    disp_thermal = cv2.applyColorMap(x, cv2.COLORMAP_JET)
+                    roi = gray_t[int(h_t*0.05):int(h_t*0.90),
+                                 int(w_t*0.05):int(w_t*0.95)]
+                    min_val = int(roi.min())
+                    max_val = int(roi.max())
+                    denom = max(max_val - min_val, 1)
+                    # Stretch to full 0-255 range
+                    x = np.clip(gray_t.astype(np.int32) - min_val, 0, denom)
+                    x = ((x * 255.0) / denom).astype(np.uint8)
+                    disp_thermal = cv2.applyColorMap(x, cv2.COLORMAP_INFERNO)
                 else:
                     gray = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2GRAY)
-                    x = np.clip(gray, 40, 160)
-                    x = ((x - 40) * (255.0 / 120)).astype(np.uint8)
-                    disp_thermal = cv2.applyColorMap(x, cv2.COLORMAP_JET)
+                    disp_thermal = cv2.applyColorMap(gray, cv2.COLORMAP_INFERNO)
                 if hotspot and np.count_nonzero(heat_mask) > 0:
                     ov = np.zeros_like(disp_thermal)
                     ov[heat_mask > 0] = [255, 0, 255]
