@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -64,6 +64,23 @@ WIN_W, WIN_H = 1280, 760
 UPDATE_MS = 100
 
 
+# ── Heat source record ────────────────────────────────────────────────────────
+@dataclass
+class HeatSourceRecord:
+    """One detected heat source event."""
+    id: int
+    timestamp: str
+    pixel_x: int
+    pixel_y: int
+    area_px: int
+    confidence: float = 0.85
+    # Canvas coords (set when mapped to heat map)
+    canvas_x: Optional[int] = None
+    canvas_y: Optional[int] = None
+    # Expiry for pink circle overlay (seconds since epoch)
+    expires_at: float = 0.0
+
+
 # ── Shared state ──────────────────────────────────────────────────────────────
 @dataclass
 class DashboardState:
@@ -80,6 +97,9 @@ class DashboardState:
     rejected: int = 0
     mapper_status: str = ""
     error: str = ""
+    # Heat source tracking
+    heat_sources: List[HeatSourceRecord] = field(default_factory=list)
+    heat_source_counter: int = 0
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
@@ -160,12 +180,16 @@ class ZBotDashboard:
             self._panel_labels[key] = lbl
             self._show_placeholder(lbl, "Press ▶ Start")
 
-        # Bottom row
-        bot_row = tk.Frame(self._root, bg="#1e1e2e")
-        bot_row.pack(fill="x", padx=4, pady=(6, 0))
+        # Bottom row — tabbed notebook
+        from tkinter import ttk
+        bot_nb = ttk.Notebook(self._root)
+        bot_nb.pack(fill="x", padx=4, pady=(6, 0))
 
-        # Stats log
-        log_f = tk.Frame(bot_row, bg="#1e1e2e")
+        # Tab 1: Detection Log + GLM
+        tab_main = tk.Frame(bot_nb, bg="#1e1e2e")
+        bot_nb.add(tab_main, text="  📋 Detection Log & AI  ")
+
+        log_f = tk.Frame(tab_main, bg="#1e1e2e")
         log_f.pack(side="left", fill="both", expand=True, padx=(0, 4))
         tk.Label(log_f, text="Detection Log", bg="#1e1e2e",
                  fg="#a6adc8", font=("Helvetica", 9, "bold")).pack(anchor="w")
@@ -174,8 +198,7 @@ class ZBotDashboard:
             font=("Courier", 8), state="disabled", wrap="word")
         self._log_text.pack(fill="both", expand=True)
 
-        # GLM conversation
-        glm_f = tk.Frame(bot_row, bg="#1e1e2e")
+        glm_f = tk.Frame(tab_main, bg="#1e1e2e")
         glm_f.pack(side="left", fill="both", expand=True)
         tk.Label(glm_f, text="🤖 Z-BOT AI Commentary (GLM)", bg="#1e1e2e",
                  fg="#f38ba8", font=("Helvetica", 9, "bold")).pack(anchor="w")
@@ -183,6 +206,33 @@ class ZBotDashboard:
             glm_f, height=8, bg="#11111b", fg="#cdd6f4",
             font=("Helvetica", 9), state="disabled", wrap="word")
         self._glm_text.pack(fill="both", expand=True)
+
+        # Tab 2: Heat Sources
+        tab_heat = tk.Frame(bot_nb, bg="#1e1e2e")
+        bot_nb.add(tab_heat, text="  🔴 Heat Sources  ")
+
+        # Summary row
+        heat_top = tk.Frame(tab_heat, bg="#1e1e2e")
+        heat_top.pack(fill="x", padx=4, pady=2)
+        self._heat_summary_var = tk.StringVar(value="No heat sources detected yet")
+        tk.Label(heat_top, textvariable=self._heat_summary_var,
+                 bg="#1e1e2e", fg="#f38ba8",
+                 font=("Helvetica", 9, "bold")).pack(side="left")
+
+        # Heat sources table
+        cols = ("ID", "Time", "Pixel X", "Pixel Y", "Area (px²)", "Confidence", "Canvas X", "Canvas Y")
+        self._heat_tree = ttk.Treeview(tab_heat, columns=cols, show="headings", height=6)
+        col_widths = [40, 80, 70, 70, 80, 80, 70, 70]
+        for col, w in zip(cols, col_widths):
+            self._heat_tree.heading(col, text=col)
+            self._heat_tree.column(col, width=w, anchor="center")
+        self._heat_tree.pack(fill="both", expand=True, padx=4, pady=2)
+
+        # Style the treeview
+        style = ttk.Style()
+        style.configure("Treeview", background="#11111b", foreground="#cdd6f4",
+                         fieldbackground="#11111b", rowheight=20)
+        style.configure("Treeview.Heading", background="#313244", foreground="#89b4fa")
 
         # Status bar
         sb = tk.Frame(self._root, bg="#313244", pady=3)
@@ -300,6 +350,9 @@ class ZBotDashboard:
             self._show_placeholder(lbl, "Press ▶ Start")
         self._clear_text(self._log_text)
         self._clear_text(self._glm_text)
+        for row in self._heat_tree.get_children():
+            self._heat_tree.delete(row)
+        self._heat_summary_var.set("No heat sources detected yet")
         self._status_var.set("Reset — press Start")
         self._stats_var.set("")
 
@@ -358,7 +411,27 @@ class ZBotDashboard:
                 heat_src = frame_thermal if frame_thermal is not None else frame_rgb
                 heat_mask = compute_heat_mask(heat_src, threshold=self._args.heat_threshold)
                 cnts, _ = cv2.findContours(heat_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                hotspot = any(cv2.contourArea(c) >= self._args.heat_min_area for c in cnts)
+                valid_cnts = [c for c in cnts if cv2.contourArea(c) >= self._args.heat_min_area]
+                hotspot = len(valid_cnts) > 0
+
+                # Extract heat source positions (centroids)
+                new_heat_sources: List[HeatSourceRecord] = []
+                for c in valid_cnts:
+                    M = cv2.moments(c)
+                    if M["m00"] > 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        area = int(cv2.contourArea(c))
+                        with self._lock:
+                            self._state.heat_source_counter += 1
+                            src_id = self._state.heat_source_counter
+                        rec = HeatSourceRecord(
+                            id=src_id,
+                            timestamp=datetime.utcnow().strftime("%H:%M:%S"),
+                            pixel_x=cx, pixel_y=cy, area_px=area,
+                            expires_at=time.time() + 8.0,  # show circle for 8s
+                        )
+                        new_heat_sources.append(rec)
 
                 system_state = "NET" if net_ratio > self._args.net_threshold else "WALL"
                 if hotspot:
@@ -418,12 +491,18 @@ class ZBotDashboard:
                         metadata={"debris_coverage_percent": round(debris_ratio * 100, 2)},
                     ))
                 if hotspot and self._should_emit("HOTSPOT"):
+                    positions = [{"id": r.id, "px": r.pixel_x, "py": r.pixel_y,
+                                  "area": r.area_px} for r in new_heat_sources]
                     self._emit(DetectionEvent(
                         timestamp=ts_iso, source="heat", event_type="HOTSPOT",
                         confidence=0.85,
                         frame_rgb=frame_rgb.copy(),
                         frame_thermal=frame_thermal.copy() if frame_thermal is not None else None,
-                        metadata={"hotspot_count": len([c for c in cnts if cv2.contourArea(c) >= self._args.heat_min_area])},
+                        metadata={
+                            "hotspot_count": len(valid_cnts),
+                            "positions": positions,
+                            "total_heat_sources_detected": 0,  # updated below
+                        },
                     ))
 
                 # ── Thermal mapper ────────────────────────────────────────────
@@ -449,6 +528,9 @@ class ZBotDashboard:
                     self._state.fire_ratio = fire_ratio
                     self._state.hotspot_detected = hotspot
                     self._state.system_state = system_state
+                    # Add new heat sources, keep all (never expire from list)
+                    if new_heat_sources:
+                        self._state.heat_sources.extend(new_heat_sources)
 
         except Exception as exc:
             with self._lock:
@@ -524,7 +606,33 @@ class ZBotDashboard:
         if s.thermal_display is not None:
             self._put_image(self._panel_labels["thermal"], s.thermal_display)
         if s.heatmap is not None and s.heatmap.size > 0:
-            self._put_image(self._panel_labels["heatmap"], s.heatmap)
+            # Draw pink circles for active heat sources on heatmap copy
+            hm_display = s.heatmap.copy()
+            now_t = time.time()
+            hm_h, hm_w = hm_display.shape[:2]
+            for src in s.heat_sources:
+                if src.expires_at > now_t:
+                    # Scale pixel coords to heatmap display size
+                    # (heatmap is cropped canvas, use raw pixel coords scaled)
+                    sx = min(max(int(src.pixel_x * hm_w / max(640, 1)), 0), hm_w - 1)
+                    sy = min(max(int(src.pixel_y * hm_h / max(480, 1)), 0), hm_h - 1)
+                    radius = max(20, int((src.area_px ** 0.5) * 0.5))
+                    # Pulsing effect: fade based on remaining time
+                    remaining = src.expires_at - now_t
+                    alpha = min(1.0, remaining / 2.0)
+                    color_intensity = int(255 * alpha)
+                    cv2.circle(hm_display, (sx, sy), radius,
+                               (color_intensity, 0, color_intensity), 2)
+                    cv2.circle(hm_display, (sx, sy), 4,
+                               (255, 100, 255), -1)
+                    cv2.putText(hm_display, f"#{src.id}",
+                                (sx + radius + 3, sy),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                (255, 150, 255), 1)
+            self._put_image(self._panel_labels["heatmap"], hm_display)
+
+        # Update Heat Sources tab
+        self._update_heat_sources_tab(s)
 
         # Drain log queue
         while True:
@@ -555,6 +663,35 @@ class ZBotDashboard:
         )
 
         self._root.after(UPDATE_MS, self._refresh_loop)
+
+    def _update_heat_sources_tab(self, s: DashboardState) -> None:
+        """Update the Heat Sources treeview and summary."""
+        total = len(s.heat_sources)
+        active = sum(1 for src in s.heat_sources if src.expires_at > time.time())
+        self._heat_summary_var.set(
+            f"Total detected: {total}  |  Active (last 8s): {active}  |  "
+            f"Latest pixel positions shown below"
+        )
+        # Refresh treeview — show last 50
+        for row in self._heat_tree.get_children():
+            self._heat_tree.delete(row)
+        for src in s.heat_sources[-50:]:
+            canvas_x = str(src.canvas_x) if src.canvas_x is not None else "—"
+            canvas_y = str(src.canvas_y) if src.canvas_y is not None else "—"
+            tag = "active" if src.expires_at > time.time() else "old"
+            self._heat_tree.insert("", "end", values=(
+                src.id, src.timestamp,
+                src.pixel_x, src.pixel_y,
+                src.area_px,
+                f"{src.confidence:.2f}",
+                canvas_x, canvas_y,
+            ), tags=(tag,))
+        self._heat_tree.tag_configure("active", foreground="#f38ba8")
+        self._heat_tree.tag_configure("old", foreground="#585b70")
+        # Scroll to bottom
+        children = self._heat_tree.get_children()
+        if children:
+            self._heat_tree.see(children[-1])
 
     # ── Close ─────────────────────────────────────────────────────────────────
 
