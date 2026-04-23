@@ -603,14 +603,22 @@ class ZBotDashboard:
                     if not self._thermal_processing:
                         self._thermal_processing = True
                         self._thermal_processing_since = now
-                        # Use raw grayscale for mapper (before colormap)
+                        # Normalize thermal_gray to full 0-255 range before mapper
+                        # This ensures border pixels (value=0) are clearly "no data"
                         if frame_thermal is not None:
-                            thermal_gray = cv2.cvtColor(frame_thermal, cv2.COLOR_BGR2GRAY)
+                            raw_gray = cv2.cvtColor(frame_thermal, cv2.COLOR_BGR2GRAY)
                         else:
-                            thermal_gray = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2GRAY)
+                            raw_gray = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2GRAY)
+                        # Auto-scale to 1-255 (reserve 0 for "no data" border)
+                        g_min, g_max = int(raw_gray.min()), int(raw_gray.max())
+                        denom = max(g_max - g_min, 1)
+                        thermal_gray_norm = np.clip(
+                            ((raw_gray.astype(np.int32) - g_min) * 254 // denom) + 1,
+                            1, 255
+                        ).astype(np.uint8)
                         threading.Thread(
                             target=self._thermal_worker,
-                            args=(frame_rgb.copy(), thermal_gray, now),
+                            args=(frame_rgb.copy(), thermal_gray_norm, now),
                             daemon=True,
                         ).start()
 

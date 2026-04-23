@@ -260,12 +260,22 @@ class ThermalMapper:
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=0,
             )
-            mask_thermal = warped_thermal > 0
-            
+            # Use the warped mask (not warped_thermal > 0) to correctly identify
+            # valid pixels — Lepton values can be near 0 for cold regions
+            warped_mask_u8 = cv2.warpPerspective(
+                np.full(thermal_gray.shape[:2], 255, dtype=np.uint8),
+                H_frame_to_canvas,
+                (canvas_w, canvas_h),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            mask_thermal = warped_mask_u8 > 0
+
             # Memory canvas for thermal (same logic)
             new_mask = mask_thermal & (self.valid_mask_thermal == 0)
             update_mask = mask_thermal & (self.valid_mask_thermal > 0)
-            
+
             if np.any(new_mask):
                 self.canvas_thermal[new_mask] = warped_thermal[new_mask]
             if np.any(update_mask) and self.memory_alpha > 0.0:
@@ -384,7 +394,9 @@ class ThermalMapper:
         if not self.valid_mask_thermal.any():
             return np.zeros((self.args.canvas_height, self.args.canvas_width, 3), dtype=np.uint8)
 
-        valid = self.canvas_thermal >= 1.0
+        # Use the uint8 valid mask (255=valid, 0=empty) — NOT canvas_thermal >= 1.0
+        # This correctly handles Lepton cold regions that map to near-zero values
+        valid = self.valid_mask_thermal > 0
 
         # Auto-scale: stretch actual data range to 0-255 for maximum contrast
         # Same principle as lepton_fixed_scale.py but adapted for 8-bit UVC output
@@ -396,9 +408,10 @@ class ThermalMapper:
         max_val = float(data.max())
         denom = max(max_val - min_val, 1.0)
 
-        stretched = np.clip(self.canvas_thermal - min_val, 0, denom)
-        stretched = ((stretched / denom) * 255.0).astype(np.uint8)
-        stretched[~valid] = 0
+        stretched = np.zeros_like(self.canvas_thermal, dtype=np.uint8)
+        stretched[valid] = np.clip(
+            ((self.canvas_thermal[valid] - min_val) / denom) * 255.0, 0, 255
+        ).astype(np.uint8)
 
         colored = cv2.applyColorMap(stretched, cv2.COLORMAP_JET)
         colored[~valid] = [0, 0, 0]
