@@ -132,6 +132,7 @@ class ZBotDashboard:
         self._orchestrator: Optional[UnifiedOrchestrator] = None
         self._mapper: Optional[ThermalMapper] = None
         self._thermal_processing = False
+        self._thermal_processing_since: float = 0.0
 
         self._cap_rgb: Optional[cv2.VideoCapture] = None
         self._cap_thermal: Optional[cv2.VideoCapture] = None
@@ -594,8 +595,14 @@ class ZBotDashboard:
                 # ── Thermal mapper ────────────────────────────────────────────
                 if self._mapper and (now - last_thermal_ts) >= thermal_interval:
                     last_thermal_ts = now
+                    # Watchdog: if processing stuck for >5s, force-reset
+                    if self._thermal_processing:
+                        if (now - self._thermal_processing_since) > 5.0:
+                            print("[DASHBOARD] Thermal worker watchdog: force-reset stuck flag")
+                            self._thermal_processing = False
                     if not self._thermal_processing:
                         self._thermal_processing = True
+                        self._thermal_processing_since = now
                         # Use raw grayscale for mapper (before colormap)
                         if frame_thermal is not None:
                             thermal_gray = cv2.cvtColor(frame_thermal, cv2.COLOR_BGR2GRAY)
@@ -638,7 +645,15 @@ class ZBotDashboard:
                 self._state.rejected = self._mapper.rejected_frames
                 self._state.mapper_status = self._mapper.status
         except Exception as exc:
+            import traceback
             print(f"[DASHBOARD] Thermal worker error: {exc}")
+            traceback.print_exc()
+            # Reset mapper on crash so next frame starts fresh
+            try:
+                self._mapper.reset()
+                print("[DASHBOARD] Mapper reset after crash")
+            except Exception:
+                pass
         finally:
             self._thermal_processing = False
 
